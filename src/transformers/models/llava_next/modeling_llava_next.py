@@ -34,7 +34,7 @@ from ...utils import (
 )
 from ..auto import AutoModel, AutoModelForCausalLM
 from .configuration_llava_next import LlavaNextConfig
-
+from .config import Global_Config
 
 logger = logging.get_logger(__name__)
 
@@ -351,6 +351,76 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         self.config.text_config.vocab_size = model_embeds.num_embeddings
         self.vocab_size = model_embeds.num_embeddings
         return model_embeds
+    
+    def find_significant_jump(self, sequence, threshold=100):
+        for i in range(1, len(sequence)):
+            if sequence[i] - sequence[i-1] > threshold:
+                return i, sequence[i]
+        return None
+
+    def get_entropy(self, softmax_logits):
+        return -(softmax_logits * softmax_logits.log()).sum()
+
+    def calculate_pua(self, x, batchwise_list_patch_idx):
+        # only works for llava 1.5
+        visual_token_tensor = None
+        starting_image_token = 35
+        image_token_length = 24 * 24
+        average_prob = 1.0 / image_token_length
+        average_hit_running = 0.0
+        average_hit_list = []
+
+        for list_patch_idx in batchwise_list_patch_idx:
+            # Assuming 'x' is a 4D tensor: [batch_size, channels, height, width]
+            visual_token_tensor = x[:, :, :, starting_image_token+1:starting_image_token+image_token_length+1]
+
+            # Apply softmax across the last dimension
+            __dtype = visual_token_tensor.dtype
+            softmax_visual_token_tensor = torch.softmax(visual_token_tensor.float(), dim=-1).to(__dtype)
+
+            # Indexing softmax_visual_token_tensor with list_patch_idx
+            selected_softmax_visual_token_tensor = softmax_visual_token_tensor[:, :, :, list_patch_idx]
+
+            # Create a mask for values greater than average_prob
+            mask_selected_softmax_visual_token_tensor = selected_softmax_visual_token_tensor > average_prob
+
+            # Count the number of 'hits'
+            hit_number = torch.sum(mask_selected_softmax_visual_token_tensor, dim=-1, keepdim=True)
+
+            # Calculate the average hit for this batch
+            average_hit = hit_number.float() / len(list_patch_idx)
+            average_hit_running += average_hit
+            average_hit_list.append(average_hit)
+
+        # Calculate the overall average hit
+        # average_hit_final = torch.mean(torch.stack(average_hit_list))
+        return average_hit_running / len(average_hit_list)
+
+
+    def calculate_vtr(x, text_to_over_write):
+        # visual attention vs text attention ratio
+        # input shape is always [batch_size, num_head, Number of tokens]
+        # only works for llava 1.5
+        # Ensure the input tensor is 4-dimensional
+        if len(x.shape) != 4:
+            raise ValueError("Input tensor must be 4-dimensional")
+
+        __dtype = x.dtype
+        x = torch.softmax(x.float(), dim=-1).to(__dtype)
+        text_attention_per_head = x[text_to_over_write]
+        mask = np.ones(attention_layer_0_head_0_last_token.shape, dtype=bool)
+        mask[text_to_over_write] = False
+        visual_attention = attention_layer_0_head_0_last_token[mask]
+
+        # Normalize to get proportions
+        total_attention = image_attention + rest_attention
+        image_proportion = image_attention / total_attention
+        rest_proportion = rest_attention / total_attention
+
+        # Stack proportions along a new dimension
+        proportions = torch.stack([image_proportion, rest_proportion], dim=-1)
+
+        return proportions.mean(dim=(1,2))
 
     # Copied from transformers.models.llava.modeling_llava.LlavaForConditionalGeneration._merge_input_ids_with_image_features
     def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask, labels):
@@ -426,7 +496,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         if labels is None:
             final_labels = None
 
-        return final_embedding, final_attention_mask, final_labels, position_ids
+        return final_embedding, final_attention_mask, final_labels, position_ids, text_to_overwrite
 
     @add_start_docstrings_to_model_forward(LLAVA_NEXT_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=LlavaNextCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -491,7 +561,10 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             if vision_feature_select_strategy is not None
             else self.config.vision_feature_select_strategy
         )
-
+        
+        text_to_over_write = None
+        base_image_feature_size = None
+        high_resolution_image_feature_size = None
         if inputs_embeds is None:
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -524,6 +597,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:
                         base_image_feature = image_feature[0]
+                        base_image_feature_size = base_image_feature.shape
                         image_feature = image_feature[1:]
 
                         if height * width != base_image_feature.shape[0]:
@@ -544,6 +618,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                             ),
                             dim=-1,
                         )
+                        high_resolution_image_feature_size = image_feature.shape
                         image_feature = image_feature.flatten(1, 2).transpose(0, 1)
                         image_feature = torch.cat((base_image_feature, image_feature), dim=0)
                     else:
@@ -552,9 +627,10 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                     new_image_features.append(image_feature)
                 image_features = torch.stack(new_image_features, dim=0)
 
-                inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                inputs_embeds, attention_mask, labels, position_ids, text_to_over_write_out = self._merge_input_ids_with_image_features(
                     image_features, inputs_embeds, input_ids, attention_mask, labels
                 )
+                text_to_over_write = text_to_over_write_out
                 if labels is None:
                     labels = torch.full_like(attention_mask, self.config.ignore_index).to(torch.long)
 
@@ -601,8 +677,27 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             return_dict=return_dict,
         )
 
+        # get the logits
         logits = outputs[0]
-
+        
+        # get the attention weights
+        attention_weights = outputs.attentions
+        bbox = Global_Config.bbox
+        # get entropy [b,]
+        entropy = self.get_entropy(torch.softmax(logits[:, -1, :].detach().cpu(), dim=1))
+        
+        # get attention metric per unit visual token and text token for the last token
+        vtr = self.calculate_vtr(attention_weights[:, :, -1, :].detach().cpu(), text_to_over_write)
+        
+        # get the average hit rate for the last token
+        pua = self.calculate_pua(attention_weights[:, :, -1, :], text_to_over_write)
+        
+        output_path = Global_Config().output_path
+        output_image_name = Global_Config().image_folder
+        filename = Global_Config().filename
+        obj_id = Global_Config().obj_id
+        
+        
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
