@@ -10,5 +10,8 @@ class Global_Config:
     attention_manipulation = False
     selected_patches_for_base = []
     selected_patches_for_hd = []
+    high_resolution_image_feature_height = 0
+    high_resolution_image_feature_width = 0
+    text_to_over_write = None
 
 PER_OBJECT_CONFIG = Global_Config()
