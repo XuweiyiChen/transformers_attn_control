@@ -34,8 +34,8 @@ from ...utils import (
 )
 from ..auto import AutoModel, AutoModelForCausalLM
 from .configuration_llava_next import LlavaNextConfig
-from .config import Global_Config
-
+from .config import PER_OBJECT_CONFIG
+import torch.nn.functional as F
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlavaNextConfig"
@@ -359,68 +359,62 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         return None
 
     def get_entropy(self, softmax_logits):
-        return -(softmax_logits * softmax_logits.log()).sum()
+        return -(softmax_logits * softmax_logits.log()).sum(dim=-1, keepdim=True)
 
-    def calculate_pua(self, x, batchwise_list_patch_idx):
-        # only works for llava 1.5
-        visual_token_tensor = None
-        starting_image_token = 35
-        image_token_length = 24 * 24
-        average_prob = 1.0 / image_token_length
-        average_hit_running = 0.0
-        average_hit_list = []
+    def calculate_pua(self, 
+        visual_attention_per_head_per_layer,
+        selected_patches_for_base,
+        selected_patches_for_hd):
+        
+        average_visual_attention = 1 / visual_attention_per_head_per_layer.shape[2]
+        softmax_visual_attention_per_head_per_layer = torch.softmax(visual_attention_per_head_per_layer, dim=-1)
+        softmax_base_image_attention = softmax_visual_attention_per_head_per_layer[:, :, :576]
+        softmax_hd_attention = softmax_visual_attention_per_head_per_layer[:, :, 576:-32]
+        base_hit_per_layer_per_head = torch.sum(
+            softmax_base_image_attention[:, :, selected_patches_for_base] > average_visual_attention, 
+            dim=2,
+            keepdim=True
+        )
+        hd_hit_per_layer_per_head = torch.sum(
+            softmax_hd_attention[:, :, selected_patches_for_hd] > average_visual_attention, 
+            dim=2,
+            keepdim=True
+        )
+        
+        entropy_base = self.get_entropy(softmax_base_image_attention)
+        entropy_hd = self.get_entropy(softmax_hd_attention)
+        entropy_visual_attention = self.get_entropy(softmax_visual_attention_per_head_per_layer)
+        
+        sample_kl_base = torch.zeros_like(softmax_base_image_attention)
+        sample_kl_hd = torch.zeros_like(softmax_hd_attention)
+        value_base = 1.0 / len(selected_patches_for_base)
+        value_hd = 1.0 / len(selected_patches_for_hd)
+        sample_kl_base[..., selected_patches_for_base] = value_base
+        sample_kl_hd[..., selected_patches_for_hd] = value_hd
+        kl_base = F.kl_div(softmax_base_image_attention.log(), sample_kl_base, reduction='none', log_target=False)
+        kl_base_reduced = kl_base.sum(dim=-1, keepdim=True)
+        kl_hd = F.kl_div(softmax_hd_attention.log(), sample_kl_hd, reduction='none', log_target=False)
+        kl_hd_reduced = kl_hd.sum(dim=-1, keepdim=True)
+        
+        return base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base_reduced, kl_hd_reduced
 
-        for list_patch_idx in batchwise_list_patch_idx:
-            # Assuming 'x' is a 4D tensor: [batch_size, channels, height, width]
-            visual_token_tensor = x[:, :, :, starting_image_token+1:starting_image_token+image_token_length+1]
 
-            # Apply softmax across the last dimension
-            __dtype = visual_token_tensor.dtype
-            softmax_visual_token_tensor = torch.softmax(visual_token_tensor.float(), dim=-1).to(__dtype)
-
-            # Indexing softmax_visual_token_tensor with list_patch_idx
-            selected_softmax_visual_token_tensor = softmax_visual_token_tensor[:, :, :, list_patch_idx]
-
-            # Create a mask for values greater than average_prob
-            mask_selected_softmax_visual_token_tensor = selected_softmax_visual_token_tensor > average_prob
-
-            # Count the number of 'hits'
-            hit_number = torch.sum(mask_selected_softmax_visual_token_tensor, dim=-1, keepdim=True)
-
-            # Calculate the average hit for this batch
-            average_hit = hit_number.float() / len(list_patch_idx)
-            average_hit_running += average_hit
-            average_hit_list.append(average_hit)
-
-        # Calculate the overall average hit
-        # average_hit_final = torch.mean(torch.stack(average_hit_list))
-        return average_hit_running / len(average_hit_list)
-
-
-    def calculate_vtr(x, text_to_over_write):
-        # visual attention vs text attention ratio
-        # input shape is always [batch_size, num_head, Number of tokens]
-        # only works for llava 1.5
-        # Ensure the input tensor is 4-dimensional
-        if len(x.shape) != 4:
-            raise ValueError("Input tensor must be 4-dimensional")
-
-        __dtype = x.dtype
-        x = torch.softmax(x.float(), dim=-1).to(__dtype)
-        text_attention_per_head = x[text_to_over_write]
-        mask = np.ones(attention_layer_0_head_0_last_token.shape, dtype=bool)
+    def calculate_vtr(self, x, text_to_over_write):
+        # x: 32 * 32 * N
+        
+        x = torch.softmax(x.float(), dim=-1)
+        text_attention_per_head_per_layer = x[:, :, text_to_over_write]
+        mask = torch.ones(x.shape[2], dtype=torch.bool)
         mask[text_to_over_write] = False
-        visual_attention = attention_layer_0_head_0_last_token[mask]
+        visual_attention_per_head_per_layer = x[:, :, mask]
 
         # Normalize to get proportions
-        total_attention = image_attention + rest_attention
-        image_proportion = image_attention / total_attention
-        rest_proportion = rest_attention / total_attention
+        image_attention_sum = torch.sum(visual_attention_per_head_per_layer, dim=-1, keepdim=True)
+        image_attention_average = torch.mean(visual_attention_per_head_per_layer, dim=-1, keepdim=True)
+        text_attention_sum = torch.sum(text_attention_per_head_per_layer, dim=-1, keepdim=True)
+        text_attention_average = torch.mean(text_attention_per_head_per_layer, dim=-1, keepdim=True)
 
-        # Stack proportions along a new dimension
-        proportions = torch.stack([image_proportion, rest_proportion], dim=-1)
-
-        return proportions.mean(dim=(1,2))
+        return image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer
 
     # Copied from transformers.models.llava.modeling_llava.LlavaForConditionalGeneration._merge_input_ids_with_image_features
     def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask, labels):
@@ -497,7 +491,55 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             final_labels = None
 
         return final_embedding, final_attention_mask, final_labels, position_ids, text_to_overwrite
+    
+    def find_covered_patches(self, img_height, img_width, bbox, patch_size=14, grid_size=24):
+        scale_x = 336 / img_width
+        scale_y = 336 / img_height
+        bbox_scaled = [bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y]
 
+        left_patch = int(bbox_scaled[0] // patch_size)
+        top_patch = int(bbox_scaled[1] // patch_size)
+        right_patch = int(bbox_scaled[2] // patch_size)
+        bottom_patch = int(bbox_scaled[3] // patch_size)
+
+        left_patch = max(0, left_patch)
+        top_patch = max(0, top_patch)
+        right_patch = min(grid_size - 1, right_patch)
+        bottom_patch = min(grid_size - 1, bottom_patch)
+
+        covered_patches = []
+        for y in range(top_patch, bottom_patch + 1):
+            for x in range(left_patch, right_patch + 1):
+                covered_patches.append(y * grid_size + x)
+
+        return covered_patches
+    
+    def find_covered_patches_arbitrary(self, img_height, img_width, bbox, M, N):
+    # Calculate the size of each patch based on the new grid dimensions
+        patch_size_x = img_width / N
+        patch_size_y = img_height / M
+
+        # Scale the bbox to the grid
+        left_patch = int(bbox[0] // patch_size_x)
+        top_patch = int(bbox[1] // patch_size_y)
+        right_patch = int(bbox[2] // patch_size_x)
+        bottom_patch = int(bbox[3] // patch_size_y)
+
+        # Ensure the patches are within the grid boundaries
+        left_patch = max(0, left_patch)
+        top_patch = max(0, top_patch)
+        right_patch = min(N - 1, right_patch)
+        bottom_patch = min(M - 1, bottom_patch)
+
+        covered_patches = []
+        # Generate the list of covered patches based on the scaled bbox
+        for y in range(top_patch, bottom_patch + 1):
+            for x in range(left_patch, right_patch + 1):
+                covered_patches.append(y * N + x)
+
+        return covered_patches
+
+    
     @add_start_docstrings_to_model_forward(LLAVA_NEXT_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=LlavaNextCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -565,6 +607,11 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         text_to_over_write = None
         base_image_feature_size = None
         high_resolution_image_feature_size = None
+        num_patch_height = None
+        num_patch_width = None
+        selected_patches_for_base = None
+        selected_patches_for_hd = None
+        PER_OBJECT_CONFIG.generated_token += 1
         if inputs_embeds is None:
             # 1. Extract the input embeddings
             inputs_embeds = self.get_input_embeddings()(input_ids)
@@ -666,6 +713,20 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 attention_mask = torch.cat((attention_mask, extended_attention_mask), dim=1)
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
+        selected_patches_for_base = self.find_covered_patches(
+            PER_OBJECT_CONFIG.image_height, 
+            PER_OBJECT_CONFIG.image_width,
+            PER_OBJECT_CONFIG.bbox,
+            patch_size=14,
+            grid_size=24
+        )
+        selected_patches_for_hd = self.find_covered_patches_arbitrary(
+            PER_OBJECT_CONFIG.image_height, 
+            PER_OBJECT_CONFIG.image_width,
+            PER_OBJECT_CONFIG.bbox,
+            high_resolution_image_feature_size[1],
+            high_resolution_image_feature_size[2]
+        )
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -676,26 +737,34 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-
+        text_to_over_write = text_to_over_write.detach().cpu()
         # get the logits
-        logits = outputs[0]
-        
+        logits = outputs[0].detach().cpu()
+        logits_need_to_be_saved = logits[:, -1, :] # [b, 1, 32064]
         # get the attention weights
         attention_weights = outputs.attentions
-        bbox = Global_Config.bbox
+        # Use list comprehension to gather the last column of attention weights for each layer
+        attention_list = [layer[:, :, -1, :].detach().cpu() for layer in attention_weights]
+
+        # Concatenate the list of tensors along the first dimension
+        # Note: It's more efficient to call .detach().cpu() after concatenation to minimize data movement
+        attention_list_concat = torch.concat(attention_list, dim=0)
+        # 32 * 1 , 32, 1, 2376 
         # get entropy [b,]
-        entropy = self.get_entropy(torch.softmax(logits[:, -1, :].detach().cpu(), dim=1))
-        
+        logits_entropy = self.get_entropy(torch.softmax(logits_need_to_be_saved, dim=1))
+        logits_entropy = logits_entropy.item()
         # get attention metric per unit visual token and text token for the last token
-        vtr = self.calculate_vtr(attention_weights[:, :, -1, :].detach().cpu(), text_to_over_write)
-        
-        # get the average hit rate for the last token
-        pua = self.calculate_pua(attention_weights[:, :, -1, :], text_to_over_write)
-        
-        output_path = Global_Config().output_path
-        output_image_name = Global_Config().image_folder
-        filename = Global_Config().filename
-        obj_id = Global_Config().obj_id
+        # visual text attention ratio
+        image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer = self.calculate_vtr(attention_list_concat, text_to_over_write)
+        base_image_feature_total = base_image_feature_size[0]
+        output_path = PER_OBJECT_CONFIG.output_path
+        output_image_name = PER_OBJECT_CONFIG.image_folder
+        filename = PER_OBJECT_CONFIG.filename
+        obj_id = PER_OBJECT_CONFIG.obj_id
+        # Per Unit Attention hit
+        base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd = self.calculate_pua(visual_attention_per_head_per_layer, selected_patches_for_base, selected_patches_for_hd)
+        # save the logits
+        # save the attention weights
         
         
         loss = None
