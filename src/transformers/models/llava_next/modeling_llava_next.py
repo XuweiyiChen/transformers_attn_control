@@ -16,7 +16,7 @@
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
-
+import os
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -36,6 +36,8 @@ from ..auto import AutoModel, AutoModelForCausalLM
 from .configuration_llava_next import LlavaNextConfig
 from .config import PER_OBJECT_CONFIG
 import torch.nn.functional as F
+import numpy as np
+import json
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlavaNextConfig"
@@ -727,6 +729,8 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             high_resolution_image_feature_size[1],
             high_resolution_image_feature_size[2]
         )
+        PER_OBJECT_CONFIG.selected_patches_for_base = selected_patches_for_base
+        PER_OBJECT_CONFIG.selected_patches_for_hd = selected_patches_for_hd
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -756,16 +760,77 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         # get attention metric per unit visual token and text token for the last token
         # visual text attention ratio
         image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer = self.calculate_vtr(attention_list_concat, text_to_over_write)
-        base_image_feature_total = base_image_feature_size[0]
         output_path = PER_OBJECT_CONFIG.output_path
-        output_image_name = PER_OBJECT_CONFIG.image_folder
-        filename = PER_OBJECT_CONFIG.filename
+        output_image_name = PER_OBJECT_CONFIG.filename
         obj_id = PER_OBJECT_CONFIG.obj_id
         # Per Unit Attention hit
         base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd = self.calculate_pua(visual_attention_per_head_per_layer, selected_patches_for_base, selected_patches_for_hd)
         # save the logits
+        genereated_token = PER_OBJECT_CONFIG.generated_token
+        save_logits_path = os.path.join(output_path, 
+                                        output_image_name, 
+                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_logits.npy")
+        np.save(save_logits_path, logits_need_to_be_saved.numpy())
         # save the attention weights
-        
+        save_attention_weights_path = os.path.join(output_path,
+                                                    output_image_name,
+                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_weights.npy")
+        np.save(save_attention_weights_path, attention_list_concat.numpy())
+        # save a json file for other metrics: logits_entropy
+        metrics = {
+            "logits_entropy": logits_entropy,
+        }
+        save_json_path = os.path.join(output_path,
+                                        output_image_name,
+                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json")
+        with open(save_json_path, 'w') as f:
+            json.dump(metrics, f)
+        # save image_attention_sum, text_attention_sum, image_attention_average, text_attention_average
+        save_attention_sum_path = os.path.join(output_path,
+                                                output_image_name,
+                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_sum.npy")
+        np.save(save_attention_sum_path, image_attention_sum.numpy())
+        save_text_attention_sum_path = os.path.join(output_path,
+                                                    output_image_name,
+                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_sum.npy")
+        np.save(save_text_attention_sum_path, text_attention_sum.numpy())
+        save_attention_average_path = os.path.join(output_path,
+                                                    output_image_name,
+                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_average.npy")
+        np.save(save_attention_average_path, image_attention_average.numpy())
+        save_text_attention_average_path = os.path.join(output_path,
+                                                        output_image_name,
+                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_average.npy")
+        np.save(save_text_attention_average_path, text_attention_average.numpy())
+        # save base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd
+        save_base_hit_per_layer_per_head_path = os.path.join(output_path,
+                                                            output_image_name,
+                                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_base_hit_per_layer_per_head.npy")
+        np.save(save_base_hit_per_layer_per_head_path, base_hit_per_layer_per_head.numpy())
+        save_hd_hit_per_layer_per_head_path = os.path.join(output_path,
+                                                            output_image_name,
+                                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head.npy")
+        np.save(save_hd_hit_per_layer_per_head_path, hd_hit_per_layer_per_head.numpy())
+        save_entropy_base_path = os.path.join(output_path,
+                                            output_image_name,
+                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_base.npy")
+        np.save(save_entropy_base_path, entropy_base.numpy())
+        save_entropy_hd_path = os.path.join(output_path,
+                                            output_image_name,
+                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_hd.npy")
+        np.save(save_entropy_hd_path, entropy_hd.numpy())
+        entropy_visual_attention_path = os.path.join(output_path,
+                                                    output_image_name,
+                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_visual_attention.npy")
+        np.save(entropy_visual_attention_path, entropy_visual_attention.numpy())
+        save_kl_base_path = os.path.join(output_path,
+                                        output_image_name,
+                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_base.npy")
+        np.save(save_kl_base_path, kl_base.numpy())
+        save_kl_hd_path = os.path.join(output_path,
+                                        output_image_name,
+                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_hd.npy")
+        np.save(save_kl_hd_path, kl_hd.numpy()) 
         
         loss = None
         if labels is not None:
