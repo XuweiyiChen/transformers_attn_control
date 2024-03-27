@@ -728,7 +728,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         )
         PER_OBJECT_CONFIG.selected_patches_for_base = selected_patches_for_base
         PER_OBJECT_CONFIG.selected_patches_for_hd = selected_patches_for_hd
-        # breakpoint()
+
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -764,8 +764,6 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         
         metrics = {
             "logits_entropy": logits_entropy,
-            "header": 32,
-            "layers": 32,
             "number_of_text_tokens": text_to_over_write.shape[0],
         }
         save_json_path = os.path.join(output_path,
@@ -776,11 +774,11 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
         # get the attention weights
         if outputs.attentions:
-            # breakpoint()
             attention_weights = outputs.attentions
             # Use list comprehension to gather the last column of attention weights for each layer
             attention_list = [layer[:, :, -1, :] for layer in attention_weights]
-            # breakpoint()
+            number_layer = len(attention_list)
+            number_head = attention_list[0].shape[1]
             del outputs.attentions
             outputs.attentions = None
             torch.cuda.empty_cache()
@@ -815,8 +813,8 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 "entropy_visual_attention": torch.sum(entropy_visual_attention).item(),
                 "kl_base": torch.sum(kl_base).item(),
                 "kl_hd": torch.sum(kl_hd).item(),
-                "header": 32,
-                "layers": 32,
+                "header": number_head,
+                "layers": number_layer,
                 "number_of_text_tokens": text_to_over_write.shape[0],
                 "number_of_visual_tokens": visual_attention_per_head_per_layer.shape[2],
             }
