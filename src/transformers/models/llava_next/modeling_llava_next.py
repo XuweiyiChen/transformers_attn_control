@@ -428,6 +428,9 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
         # Compute the maximum embed dimension
         max_embed_dim = (num_special_image_tokens.max() * (num_image_patches - 1)) + sequence_length
+        batch_indices, image_indices = torch.where(input_ids == self.config.image_token_index)
+        # hopefully there is only 1 image
+        PER_OBJECT_CONFIG.system_prompt_offset = image_indices.item()
         batch_indices, non_image_indices = torch.where(input_ids != self.config.image_token_index)
 
         # 2. Compute the positions where text should be written
@@ -666,6 +669,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                         PER_OBJECT_CONFIG.high_resolution_image_feature_height = image_feature.shape[1]
                         PER_OBJECT_CONFIG.high_resolution_image_feature_width = image_feature.shape[2]
                         image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                        PER_OBJECT_CONFIG.base_image_offset = base_image_feature.shape[0]
                         image_feature = torch.cat((base_image_feature, image_feature), dim=0)
                     else:
                         image_feature = image_feature[0]
@@ -775,8 +779,12 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         # get the attention weights
         if outputs.attentions:
             attention_weights = outputs.attentions
+            attention_list = None
             # Use list comprehension to gather the last column of attention weights for each layer
-            attention_list = [layer[:, :, -1, :] for layer in attention_weights]
+            if PER_OBJECT_CONFIG.is_seven_billion:
+                attention_list = [layer[:, :, -1, :].cpu() for layer in attention_weights]
+            else:
+                attention_list = [layer[:, :, -1, :] for layer in attention_weights]
             number_layer = len(attention_list)
             number_head = attention_list[0].shape[1]
             del outputs.attentions

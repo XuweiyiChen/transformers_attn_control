@@ -49,12 +49,11 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_llama import LlamaConfig
-
+from ..llava_next.config import PER_OBJECT_CONFIG
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
-
 
 logger = logging.get_logger(__name__)
 
@@ -316,6 +315,33 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    def adjust_and_scale_attention(self, attn_weights, selected_patches, offset, scale_factor, device):
+    # Adjust selected patches by the given offset and scale the attention weights
+        if selected_patches:  # Check if the list is not empty
+            # Adjust each selected patch index by the offset
+            adjusted_patches = [patch + offset for patch in selected_patches]
+            # Convert to a tensor
+            adjusted_patches_tensor = torch.tensor(adjusted_patches, device=device, dtype=torch.long)
+            # Apply the scaling factor to the attention weights for these patches
+            attn_weights[:, :, -1, adjusted_patches_tensor] += scale_factor
+
+    def adjust_and_scale_attention_2(self, attn_weights, selected_patches, offset, scale_factor, scale_down_factor, device):
+        # Convert all patch indices to tensors
+        all_patches_tensor = torch.arange(attn_weights.size(-1), device=device, dtype=torch.long)
+        # Adjust selected patch indices by the given offset
+        adjusted_patches = [patch + offset for patch in selected_patches]
+        # Convert adjusted patch indices to a tensor
+        adjusted_patches_tensor = torch.tensor(adjusted_patches, device=device, dtype=torch.long)
+        
+        # Create a mask for selected patches
+        selected_mask = torch.zeros_like(all_patches_tensor, dtype=torch.bool)
+        selected_mask[adjusted_patches_tensor] = True
+
+        # Scale down attention weights for non-selected patches
+        attn_weights[:, :, -1, ~selected_mask] *= scale_down_factor
+
+        # Scale up attention weights for selected patches
+        attn_weights[:, :, -1, selected_mask] *= scale_factor
 
     def forward(
         self,
@@ -373,7 +399,54 @@ class LlamaAttention(nn.Module):
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
+        
+        # if PER_OBJECT_CONFIG.attention_manipulation:
+        #     # attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        #     device = attn_weights.device
+        #     scale_factor = PER_OBJECT_CONFIG.attention_manipulation_scale
 
+        #     # Adjust and scale attention weights for "base" selected patches
+        #     self.adjust_and_scale_attention(
+        #         attn_weights,
+        #         PER_OBJECT_CONFIG.selected_patches_for_base,
+        #         PER_OBJECT_CONFIG.system_prompt_offset,
+        #         scale_factor,
+        #         device
+        #     )
+            
+        #     # Adjust and scale attention weights for "HD" selected patches
+        #     self.adjust_and_scale_attention(
+        #         attn_weights,
+        #         PER_OBJECT_CONFIG.selected_patches_for_hd,
+        #         PER_OBJECT_CONFIG.system_prompt_offset + PER_OBJECT_CONFIG.base_image_offset,
+        #         scale_factor,
+        #         device
+        #     )
+        if PER_OBJECT_CONFIG.attention_manipulation:
+            device = attn_weights.device
+            scale_factor = PER_OBJECT_CONFIG.scale_up_factor
+            # Define a scale_down_factor to reduce attention for non-selected patches
+            scale_down_factor = PER_OBJECT_CONFIG.scale_down_factor  # This should be < 1.0
+
+            # Adjust and scale attention weights for "base" selected patches
+            self.adjust_and_scale_attention_2(
+                attn_weights,
+                PER_OBJECT_CONFIG.selected_patches_for_base,
+                PER_OBJECT_CONFIG.system_prompt_offset,
+                scale_factor,
+                scale_down_factor,
+                device
+            )
+            
+            # Adjust and scale attention weights for "HD" selected patches
+            self.adjust_and_scale_attention_2(
+                attn_weights,
+                PER_OBJECT_CONFIG.selected_patches_for_hd,
+                PER_OBJECT_CONFIG.system_prompt_offset + PER_OBJECT_CONFIG.base_image_offset,
+                scale_factor,
+                scale_down_factor,
+                device
+            )
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
@@ -401,7 +474,9 @@ class LlamaAttention(nn.Module):
         else:
             del attn_weights
             torch.cuda.empty_cache()
-        return attn_output, attn_weights_brefore_softmax.detach().cpu(), past_key_value
+        if not PER_OBJECT_CONFIG.is_seven_billion:
+            attn_weights_brefore_softmax = attn_weights_brefore_softmax.detach().cpu()
+        return attn_output, attn_weights_brefore_softmax, past_key_value
 
 
 class LlamaFlashAttention2(LlamaAttention):
