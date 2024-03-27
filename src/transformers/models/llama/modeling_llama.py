@@ -398,8 +398,12 @@ class LlamaAttention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
-
-        return attn_output, attn_weights_brefore_softmax, past_key_value
+        # breakpoint()
+        attn_weights = attn_weights.detach().cpu()
+        attn_weights = None
+        del attn_weights
+        torch.cuda.empty_cache()
+        return attn_output, attn_weights_brefore_softmax.detach().cpu(), past_key_value
 
 
 class LlamaFlashAttention2(LlamaAttention):
@@ -674,7 +678,6 @@ class LlamaSdpaAttention(LlamaAttention):
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
         )
-
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
@@ -1184,7 +1187,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,

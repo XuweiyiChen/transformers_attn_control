@@ -728,6 +728,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         )
         PER_OBJECT_CONFIG.selected_patches_for_base = selected_patches_for_base
         PER_OBJECT_CONFIG.selected_patches_for_hd = selected_patches_for_hd
+        # breakpoint()
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -775,10 +776,11 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
         # get the attention weights
         if outputs.attentions:
+            # breakpoint()
             attention_weights = outputs.attentions
             # Use list comprehension to gather the last column of attention weights for each layer
-            attention_list = [layer[:, :, -1, :].detach().cpu() for layer in attention_weights]
-
+            attention_list = [layer[:, :, -1, :] for layer in attention_weights]
+            # breakpoint()
             del outputs.attentions
             outputs.attentions = None
             torch.cuda.empty_cache()
