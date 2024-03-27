@@ -746,26 +746,11 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         # get the logits
         logits = outputs[0]
         logits_need_to_be_saved = logits[:, -1, :].detach().cpu() # [b, 1, 32064]
-        # get the attention weights
-        attention_weights = outputs.attentions
-        # Use list comprehension to gather the last column of attention weights for each layer
-        attention_list = [layer[:, :, -1, :].detach().cpu() for layer in attention_weights]
-
-        # Concatenate the list of tensors along the first dimension
-        # Note: It's more efficient to call .detach().cpu() after concatenation to minimize data movement
-        attention_list_concat = torch.concat(attention_list, dim=0)
-        # 32 * 1 , 32, 1, 2376 
-        # get entropy [b,]
         logits_entropy = self.get_entropy(torch.softmax(logits_need_to_be_saved, dim=1))
         logits_entropy = logits_entropy.item()
-        # get attention metric per unit visual token and text token for the last token
-        # visual text attention ratio
-        image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer = self.calculate_vtr(attention_list_concat, text_to_over_write)
         output_path = PER_OBJECT_CONFIG.output_path
         output_image_name = PER_OBJECT_CONFIG.filename
         obj_id = PER_OBJECT_CONFIG.obj_id
-        # Per Unit Attention hit
-        base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd = self.calculate_pua(visual_attention_per_head_per_layer, selected_patches_for_base, selected_patches_for_hd)
         # save the logits
         genereated_token = PER_OBJECT_CONFIG.generated_token
         save_logits_path = os.path.join(output_path, 
@@ -775,120 +760,151 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                                         f"obj_id_{obj_id}_generated_token_{genereated_token}_logits.npy")
         os.makedirs(os.path.dirname(save_logits_path), exist_ok=True)
         np.save(save_logits_path, logits_need_to_be_saved.numpy())
-        # save the attention weights
-        save_attention_weights_path = os.path.join(output_path,
-                                                    output_image_name,
-                                                    f"obj_id{obj_id}",
-                                                    f"{genereated_token}",
-                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_weights.npy")
-        os.makedirs(os.path.dirname(save_attention_weights_path), exist_ok=True)
-        np.save(save_attention_weights_path, attention_list_concat.numpy())
-        # save a json file for other metrics: logits_entropy
+        
         metrics = {
             "logits_entropy": logits_entropy,
-            "image_attention_sum": torch.sum(image_attention_sum).item(),
-            "text_attention_sum": torch.sum(text_attention_sum).item(),
-            "image_attention_average": torch.sum(image_attention_average).item(),
-            "text_attention_average": torch.sum(text_attention_average).item(),
-            "base_hit_per_layer_per_head": torch.sum(base_hit_per_layer_per_head).item(),
-            "hd_hit_per_layer_per_head": torch.sum(hd_hit_per_layer_per_head).item(),
-            "entropy_base": torch.sum(entropy_base).item(),
-            "entropy_hd": torch.sum(entropy_hd).item(),
-            "entropy_visual_attention": torch.sum(entropy_visual_attention).item(),
-            "kl_base": torch.sum(kl_base).item(),
-            "kl_hd": torch.sum(kl_hd).item(),
             "header": 32,
             "layers": 32,
             "number_of_text_tokens": text_to_over_write.shape[0],
-            "number_of_visual_tokens": visual_attention_per_head_per_layer.shape[2],
         }
         save_json_path = os.path.join(output_path,
-                                        output_image_name,
-                                        f"obj_id{obj_id}",
-                                        f"{genereated_token}",
-                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json")
+                                output_image_name,
+                                f"obj_id{obj_id}",
+                                f"{genereated_token}",
+                                f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json")
         os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
-        with open(save_json_path, 'w') as f:
-            json.dump(metrics, f)
-        # save image_attention_sum, text_attention_sum, image_attention_average, text_attention_average
-        save_attention_sum_path = os.path.join(output_path,
-                                                output_image_name,
-                                                f"obj_id{obj_id}",
-                                                f"{genereated_token}",
-                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_sum.npy")
-        os.makedirs(os.path.dirname(save_attention_sum_path), exist_ok=True)
-        np.save(save_attention_sum_path, image_attention_sum.numpy())
-        save_text_attention_sum_path = os.path.join(output_path,
-                                                    output_image_name,
-                                                    f"obj_id{obj_id}",
-                                                    f"{genereated_token}",
-                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_sum.npy")
-        os.makedirs(os.path.dirname(save_text_attention_sum_path), exist_ok=True)
-        np.save(save_text_attention_sum_path, text_attention_sum.numpy())
-        save_attention_average_path = os.path.join(output_path,
-                                                    output_image_name,
-                                                    f"obj_id{obj_id}",
-                                                    f"{genereated_token}",
-                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_average.npy")
-        os.makedirs(os.path.dirname(save_attention_average_path), exist_ok=True)
-        np.save(save_attention_average_path, image_attention_average.numpy())
-        save_text_attention_average_path = os.path.join(output_path,
+        # get the attention weights
+        if outputs.attentions:
+            attention_weights = outputs.attentions
+            # Use list comprehension to gather the last column of attention weights for each layer
+            attention_list = [layer[:, :, -1, :].detach().cpu() for layer in attention_weights]
+
+            del outputs.attentions
+            outputs.attentions = None
+            torch.cuda.empty_cache()
+        
+            # Concatenate the list of tensors along the first dimension
+            # Note: It's more efficient to call .detach().cpu() after concatenation to minimize data movement
+            attention_list_concat = torch.concat(attention_list, dim=0)
+            # get attention metric per unit visual token and text token for the last token
+            # visual text attention ratio
+            image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer = self.calculate_vtr(attention_list_concat, text_to_over_write)
+            # Per Unit Attention hit
+            base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd = self.calculate_pua(visual_attention_per_head_per_layer, selected_patches_for_base, selected_patches_for_hd)
+            # save the attention weights
+            save_attention_weights_path = os.path.join(output_path,
                                                         output_image_name,
                                                         f"obj_id{obj_id}",
                                                         f"{genereated_token}",
-                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_average.npy")
-        os.makedirs(os.path.dirname(save_text_attention_average_path), exist_ok=True)
-        np.save(save_text_attention_average_path, text_attention_average.numpy())
-        # save base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd
-        save_base_hit_per_layer_per_head_path = os.path.join(output_path,
-                                                            output_image_name,
-                                                            f"obj_id{obj_id}",
-                                                            f"{genereated_token}",
-                                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_base_hit_per_layer_per_head.npy")
-        os.makedirs(os.path.dirname(save_base_hit_per_layer_per_head_path), exist_ok=True)
-        np.save(save_base_hit_per_layer_per_head_path, base_hit_per_layer_per_head.numpy())
-        save_hd_hit_per_layer_per_head_path = os.path.join(output_path,
-                                                            output_image_name,
-                                                            f"obj_id{obj_id}",
-                                                            f"{genereated_token}",
-                                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head.npy")
-        os.makedirs(os.path.dirname(save_hd_hit_per_layer_per_head_path), exist_ok=True)
-        np.save(save_hd_hit_per_layer_per_head_path, hd_hit_per_layer_per_head.numpy())
-        save_entropy_base_path = os.path.join(output_path,
+                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_weights.npy")
+            os.makedirs(os.path.dirname(save_attention_weights_path), exist_ok=True)
+            np.save(save_attention_weights_path, attention_list_concat.numpy())
+            # save a json file for other metrics: logits_entropy
+            metrics = {
+                "logits_entropy": logits_entropy,
+                "image_attention_sum": torch.sum(image_attention_sum).item(),
+                "text_attention_sum": torch.sum(text_attention_sum).item(),
+                "image_attention_average": torch.sum(image_attention_average).item(),
+                "text_attention_average": torch.sum(text_attention_average).item(),
+                "base_hit_per_layer_per_head": torch.sum(base_hit_per_layer_per_head).item(),
+                "hd_hit_per_layer_per_head": torch.sum(hd_hit_per_layer_per_head).item(),
+                "entropy_base": torch.sum(entropy_base).item(),
+                "entropy_hd": torch.sum(entropy_hd).item(),
+                "entropy_visual_attention": torch.sum(entropy_visual_attention).item(),
+                "kl_base": torch.sum(kl_base).item(),
+                "kl_hd": torch.sum(kl_hd).item(),
+                "header": 32,
+                "layers": 32,
+                "number_of_text_tokens": text_to_over_write.shape[0],
+                "number_of_visual_tokens": visual_attention_per_head_per_layer.shape[2],
+            }
+            save_json_path = os.path.join(output_path,
                                             output_image_name,
                                             f"obj_id{obj_id}",
                                             f"{genereated_token}",
-                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_base.npy")
-        os.makedirs(os.path.dirname(save_entropy_base_path), exist_ok=True)
-        np.save(save_entropy_base_path, entropy_base.numpy())
-        save_entropy_hd_path = os.path.join(output_path,
-                                            output_image_name,
-                                            f"obj_id{obj_id}",
-                                            f"{genereated_token}",
-                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_hd.npy")
-        os.makedirs(os.path.dirname(save_entropy_hd_path), exist_ok=True)
-        np.save(save_entropy_hd_path, entropy_hd.numpy())
-        entropy_visual_attention_path = os.path.join(output_path,
+                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json")
+            os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
+            with open(save_json_path, 'w') as f:
+                json.dump(metrics, f)
+            # save image_attention_sum, text_attention_sum, image_attention_average, text_attention_average
+            save_attention_sum_path = os.path.join(output_path,
                                                     output_image_name,
                                                     f"obj_id{obj_id}",
                                                     f"{genereated_token}",
-                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_visual_attention.npy")
-        os.makedirs(os.path.dirname(entropy_visual_attention_path), exist_ok=True)
-        np.save(entropy_visual_attention_path, entropy_visual_attention.numpy())
-        save_kl_base_path = os.path.join(output_path,
-                                        output_image_name,
-                                        f"obj_id{obj_id}",
-                                        f"{genereated_token}",
-                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_base.npy")
-        os.makedirs(os.path.dirname(save_kl_base_path), exist_ok=True)
-        np.save(save_kl_base_path, kl_base.numpy())
-        save_kl_hd_path = os.path.join(output_path,
-                                        output_image_name,
-                                        f"obj_id{obj_id}",
-                                        f"{genereated_token}",
-                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_hd.npy")
-        os.makedirs(os.path.dirname(save_kl_hd_path), exist_ok=True)
-        np.save(save_kl_hd_path, kl_hd.numpy()) 
+                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_sum.npy")
+            os.makedirs(os.path.dirname(save_attention_sum_path), exist_ok=True)
+            np.save(save_attention_sum_path, image_attention_sum.numpy())
+            save_text_attention_sum_path = os.path.join(output_path,
+                                                        output_image_name,
+                                                        f"obj_id{obj_id}",
+                                                        f"{genereated_token}",
+                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_sum.npy")
+            os.makedirs(os.path.dirname(save_text_attention_sum_path), exist_ok=True)
+            np.save(save_text_attention_sum_path, text_attention_sum.numpy())
+            save_attention_average_path = os.path.join(output_path,
+                                                        output_image_name,
+                                                        f"obj_id{obj_id}",
+                                                        f"{genereated_token}",
+                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_average.npy")
+            os.makedirs(os.path.dirname(save_attention_average_path), exist_ok=True)
+            np.save(save_attention_average_path, image_attention_average.numpy())
+            save_text_attention_average_path = os.path.join(output_path,
+                                                            output_image_name,
+                                                            f"obj_id{obj_id}",
+                                                            f"{genereated_token}",
+                                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_average.npy")
+            os.makedirs(os.path.dirname(save_text_attention_average_path), exist_ok=True)
+            np.save(save_text_attention_average_path, text_attention_average.numpy())
+            # save base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd
+            save_base_hit_per_layer_per_head_path = os.path.join(output_path,
+                                                                output_image_name,
+                                                                f"obj_id{obj_id}",
+                                                                f"{genereated_token}",
+                                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_base_hit_per_layer_per_head.npy")
+            os.makedirs(os.path.dirname(save_base_hit_per_layer_per_head_path), exist_ok=True)
+            np.save(save_base_hit_per_layer_per_head_path, base_hit_per_layer_per_head.numpy())
+            save_hd_hit_per_layer_per_head_path = os.path.join(output_path,
+                                                                output_image_name,
+                                                                f"obj_id{obj_id}",
+                                                                f"{genereated_token}",
+                                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head.npy")
+            os.makedirs(os.path.dirname(save_hd_hit_per_layer_per_head_path), exist_ok=True)
+            np.save(save_hd_hit_per_layer_per_head_path, hd_hit_per_layer_per_head.numpy())
+            save_entropy_base_path = os.path.join(output_path,
+                                                output_image_name,
+                                                f"obj_id{obj_id}",
+                                                f"{genereated_token}",
+                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_base.npy")
+            os.makedirs(os.path.dirname(save_entropy_base_path), exist_ok=True)
+            np.save(save_entropy_base_path, entropy_base.numpy())
+            save_entropy_hd_path = os.path.join(output_path,
+                                                output_image_name,
+                                                f"obj_id{obj_id}",
+                                                f"{genereated_token}",
+                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_hd.npy")
+            os.makedirs(os.path.dirname(save_entropy_hd_path), exist_ok=True)
+            np.save(save_entropy_hd_path, entropy_hd.numpy())
+            entropy_visual_attention_path = os.path.join(output_path,
+                                                        output_image_name,
+                                                        f"obj_id{obj_id}",
+                                                        f"{genereated_token}",
+                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_visual_attention.npy")
+            os.makedirs(os.path.dirname(entropy_visual_attention_path), exist_ok=True)
+            np.save(entropy_visual_attention_path, entropy_visual_attention.numpy())
+            save_kl_base_path = os.path.join(output_path,
+                                            output_image_name,
+                                            f"obj_id{obj_id}",
+                                            f"{genereated_token}",
+                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_base.npy")
+            os.makedirs(os.path.dirname(save_kl_base_path), exist_ok=True)
+            np.save(save_kl_base_path, kl_base.numpy())
+            save_kl_hd_path = os.path.join(output_path,
+                                            output_image_name,
+                                            f"obj_id{obj_id}",
+                                            f"{genereated_token}",
+                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_hd.npy")
+            os.makedirs(os.path.dirname(save_kl_hd_path), exist_ok=True)
+            np.save(save_kl_hd_path, kl_hd.numpy()) 
         
         loss = None
         if labels is not None:
