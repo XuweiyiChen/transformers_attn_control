@@ -398,9 +398,9 @@ class LlamaAttention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
-        # breakpoint()
-        del attn_weights
-        torch.cuda.empty_cache()
+        else:
+            del attn_weights
+            torch.cuda.empty_cache()
         return attn_output, attn_weights_brefore_softmax.detach().cpu(), past_key_value
 
 
