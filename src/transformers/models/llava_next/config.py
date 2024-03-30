@@ -7,7 +7,8 @@ class Global_Config:
     image_height = -1
     image_width = -1
     generated_token = -1
-    attention_manipulation = False
+    attention_manipulation = True
+    attention_manipulation_version = 1
     attention_manipulation_scale = 5
     selected_patches_for_base = []
     selected_patches_for_hd = []
@@ -16,7 +17,7 @@ class Global_Config:
     text_to_over_write = None
     base_image_offset = -1
     system_prompt_offset = -1
-    is_seven_billion = False
+    is_seven_billion = True
     scale_down_factor = 0.75
     scale_up_factor = 1.35
     
