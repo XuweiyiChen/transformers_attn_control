@@ -38,6 +38,7 @@ from .config import PER_OBJECT_CONFIG
 import torch.nn.functional as F
 import numpy as np
 import json
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlavaNextConfig"
@@ -152,9 +153,13 @@ class LlavaNextMultiModalProjector(nn.Module):
     def __init__(self, config: LlavaNextConfig):
         super().__init__()
 
-        self.linear_1 = nn.Linear(config.vision_config.hidden_size, config.text_config.hidden_size, bias=True)
+        self.linear_1 = nn.Linear(
+            config.vision_config.hidden_size, config.text_config.hidden_size, bias=True
+        )
         self.act = ACT2FN[config.projector_hidden_act]
-        self.linear_2 = nn.Linear(config.text_config.hidden_size, config.text_config.hidden_size, bias=True)
+        self.linear_2 = nn.Linear(
+            config.text_config.hidden_size, config.text_config.hidden_size, bias=True
+        )
 
     def forward(self, image_features):
         hidden_states = self.linear_1(image_features)
@@ -309,13 +314,17 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
 
         self.multi_modal_projector = LlavaNextMultiModalProjector(config)
 
-        self.image_newline = nn.Parameter(torch.empty(config.text_config.hidden_size, dtype=self.dtype))
+        self.image_newline = nn.Parameter(
+            torch.empty(config.text_config.hidden_size, dtype=self.dtype)
+        )
 
         self.vocab_size = config.text_config.vocab_size
         self.language_model = AutoModelForCausalLM.from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        self.pad_token_id = (
+            self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        )
         self.post_init()
 
     # Copied from transformers.models.llava.modeling_llava.LlavaForConditionalGeneration.get_input_embeddings
@@ -347,63 +356,90 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         return self.language_model.tie_weights()
 
     # Copied from transformers.models.llava.modeling_llava.LlavaForConditionalGeneration.resize_token_embeddings
-    def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
-        model_embeds = self.language_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+    def resize_token_embeddings(
+        self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None
+    ) -> nn.Embedding:
+        model_embeds = self.language_model.resize_token_embeddings(
+            new_num_tokens, pad_to_multiple_of
+        )
         # update vocab size
         self.config.text_config.vocab_size = model_embeds.num_embeddings
         self.vocab_size = model_embeds.num_embeddings
         return model_embeds
-    
+
     def find_significant_jump(self, sequence, threshold=100):
         for i in range(1, len(sequence)):
-            if sequence[i] - sequence[i-1] > threshold:
+            if sequence[i] - sequence[i - 1] > threshold:
                 return i, sequence[i]
         return None
 
     def get_entropy(self, softmax_logits):
         return -(softmax_logits * softmax_logits.log()).sum(dim=-1, keepdim=True)
 
-    def calculate_pua(self, 
+    def calculate_pua(
+        self,
         visual_attention_per_head_per_layer,
-        selected_patches_for_base,
-        selected_patches_for_hd):
-        
+        selected_patches_for_base_list,
+        selected_patches_for_hd_list,
+    ):
+
         average_visual_attention = 1 / visual_attention_per_head_per_layer.shape[2]
-        softmax_visual_attention_per_head_per_layer = torch.softmax(visual_attention_per_head_per_layer, dim=-1)
-        softmax_base_image_attention = softmax_visual_attention_per_head_per_layer[:, :, :576]
+        softmax_visual_attention_per_head_per_layer = torch.softmax(
+            visual_attention_per_head_per_layer, dim=-1
+        )
+        softmax_base_image_attention = softmax_visual_attention_per_head_per_layer[
+            :, :, :576
+        ]
         softmax_hd_attention = softmax_visual_attention_per_head_per_layer[:, :, 576:]
-        base_hit_per_layer_per_head = torch.sum(
-            softmax_base_image_attention[:, :, selected_patches_for_base] > average_visual_attention, 
-            dim=2,
-            keepdim=True
-        )
-        hd_hit_per_layer_per_head = torch.sum(
-            softmax_hd_attention[:, :, selected_patches_for_hd] > average_visual_attention, 
-            dim=2,
-            keepdim=True
-        )
-        
+
+        base_hit_per_layer_per_head_list = []
+        hd_hit_per_layer_per_head_list = []
+
+        for selected_patches_for_base, selected_patches_for_hd in zip(
+            selected_patches_for_base_list, selected_patches_for_hd_list
+        ):
+            base_hit_per_layer_per_head = torch.sum(
+                softmax_base_image_attention[:, :, selected_patches_for_base]
+                > average_visual_attention,
+                dim=2,
+                keepdim=True,
+            )
+            hd_hit_per_layer_per_head = torch.sum(
+                softmax_hd_attention[:, :, selected_patches_for_hd]
+                > average_visual_attention,
+                dim=2,
+                keepdim=True,
+            )
+            base_hit_per_layer_per_head_list.append(base_hit_per_layer_per_head)
+            hd_hit_per_layer_per_head_list.append(hd_hit_per_layer_per_head)
+
         entropy_base = self.get_entropy(softmax_base_image_attention)
         entropy_hd = self.get_entropy(softmax_hd_attention)
-        entropy_visual_attention = self.get_entropy(softmax_visual_attention_per_head_per_layer)
-        
-        sample_kl_base = torch.zeros_like(softmax_base_image_attention)
-        sample_kl_hd = torch.zeros_like(softmax_hd_attention)
-        value_base = 1.0 / len(selected_patches_for_base)
-        value_hd = 1.0 / len(selected_patches_for_hd)
-        sample_kl_base[..., selected_patches_for_base] = value_base
-        sample_kl_hd[..., selected_patches_for_hd] = value_hd
-        kl_base = F.kl_div(softmax_base_image_attention.log(), sample_kl_base, reduction='none', log_target=False)
-        kl_base_reduced = kl_base.sum(dim=-1, keepdim=True)
-        kl_hd = F.kl_div(softmax_hd_attention.log(), sample_kl_hd, reduction='none', log_target=False)
-        kl_hd_reduced = kl_hd.sum(dim=-1, keepdim=True)
-        
-        return base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base_reduced, kl_hd_reduced
+        entropy_visual_attention = self.get_entropy(
+            softmax_visual_attention_per_head_per_layer
+        )
 
+        length_patch_base = [
+            len(selected_patches_for_base)
+            for selected_patches_for_base in selected_patches_for_base_list
+        ]
+        length_patch_hd = [
+            len(selected_patches_for_hd)
+            for selected_patches_for_hd in selected_patches_for_hd_list
+        ]
+
+        return (
+            base_hit_per_layer_per_head_list,
+            hd_hit_per_layer_per_head_list,
+            entropy_base,
+            entropy_hd,
+            entropy_visual_attention,
+            length_patch_base,
+            length_patch_hd,
+        )
 
     def calculate_vtr(self, x, text_to_over_write):
         # x: 32 * 32 * N
-        
         x = torch.softmax(x.float(), dim=-1)
         text_attention_per_head_per_layer = x[:, :, text_to_over_write]
         mask = torch.ones(x.shape[2], dtype=torch.bool)
@@ -411,34 +447,61 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         visual_attention_per_head_per_layer = x[:, :, mask]
 
         # Normalize to get proportions
-        image_attention_sum = torch.sum(visual_attention_per_head_per_layer, dim=-1, keepdim=True)
-        image_attention_average = torch.mean(visual_attention_per_head_per_layer, dim=-1, keepdim=True)
-        text_attention_sum = torch.sum(text_attention_per_head_per_layer, dim=-1, keepdim=True)
-        text_attention_average = torch.mean(text_attention_per_head_per_layer, dim=-1, keepdim=True)
+        image_attention_sum = torch.sum(
+            visual_attention_per_head_per_layer, dim=-1, keepdim=True
+        )
+        image_attention_average = torch.mean(
+            visual_attention_per_head_per_layer, dim=-1, keepdim=True
+        )
+        text_attention_sum = torch.sum(
+            text_attention_per_head_per_layer, dim=-1, keepdim=True
+        )
+        text_attention_average = torch.mean(
+            text_attention_per_head_per_layer, dim=-1, keepdim=True
+        )
 
-        return image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer
+        return (
+            image_attention_sum,
+            text_attention_sum,
+            image_attention_average,
+            text_attention_average,
+            visual_attention_per_head_per_layer,
+        )
 
     # Copied from transformers.models.llava.modeling_llava.LlavaForConditionalGeneration._merge_input_ids_with_image_features
-    def _merge_input_ids_with_image_features(self, image_features, inputs_embeds, input_ids, attention_mask, labels):
+    def _merge_input_ids_with_image_features(
+        self, image_features, inputs_embeds, input_ids, attention_mask, labels
+    ):
         num_images, num_image_patches, embed_dim = image_features.shape
         batch_size, sequence_length = input_ids.shape
-        left_padding = not torch.sum(input_ids[:, -1] == torch.tensor(self.pad_token_id))
+        left_padding = not torch.sum(
+            input_ids[:, -1] == torch.tensor(self.pad_token_id)
+        )
         # 1. Create a mask to know where special image tokens are
         special_image_token_mask = input_ids == self.config.image_token_index
         num_special_image_tokens = torch.sum(special_image_token_mask, dim=-1)
         # Compute the maximum embed dimension
-        max_embed_dim = (num_special_image_tokens.max() * (num_image_patches - 1)) + sequence_length
-        batch_indices, image_indices = torch.where(input_ids == self.config.image_token_index)
+        max_embed_dim = (
+            num_special_image_tokens.max() * (num_image_patches - 1)
+        ) + sequence_length
+        batch_indices, image_indices = torch.where(
+            input_ids == self.config.image_token_index
+        )
         # hopefully there is only 1 image
         PER_OBJECT_CONFIG.system_prompt_offset = image_indices.item()
-        batch_indices, non_image_indices = torch.where(input_ids != self.config.image_token_index)
+        batch_indices, non_image_indices = torch.where(
+            input_ids != self.config.image_token_index
+        )
 
         # 2. Compute the positions where text should be written
         # Calculate new positions for text tokens in merged image-text sequence.
         # `special_image_token_mask` identifies image tokens. Each image token will be replaced by `nb_text_tokens_per_images - 1` text tokens.
         # `torch.cumsum` computes how each image token shifts subsequent text token positions.
         # - 1 to adjust for zero-based indexing, as `cumsum` inherently increases indices by one.
-        new_token_positions = torch.cumsum((special_image_token_mask * (num_image_patches - 1) + 1), -1) - 1
+        new_token_positions = (
+            torch.cumsum((special_image_token_mask * (num_image_patches - 1) + 1), -1)
+            - 1
+        )
         nb_image_pad = max_embed_dim - 1 - new_token_positions[:, -1]
         if left_padding:
             new_token_positions += nb_image_pad[:, None]  # offset for left padding
@@ -446,14 +509,24 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
 
         # 3. Create the full embedding, already padded to the maximum position
         final_embedding = torch.zeros(
-            batch_size, max_embed_dim, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device
+            batch_size,
+            max_embed_dim,
+            embed_dim,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
         )
         final_attention_mask = torch.zeros(
-            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=inputs_embeds.device
+            batch_size,
+            max_embed_dim,
+            dtype=attention_mask.dtype,
+            device=inputs_embeds.device,
         )
         if labels is not None:
             final_labels = torch.full(
-                (batch_size, max_embed_dim), self.config.ignore_index, dtype=input_ids.dtype, device=input_ids.device
+                (batch_size, max_embed_dim),
+                self.config.ignore_index,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
             )
         # In case the Vision model or the Language model has been offloaded to CPU, we need to manually
         # set the corresponding tensors into their correct target device.
@@ -467,14 +540,22 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
 
         # 4. Fill the embeddings based on the mask. If we have ["hey" "<image>", "how", "are"]
         # we need to index copy on [0, 577, 578, 579] for the text and [1:576] for the image features
-        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
-        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
+        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[
+            batch_indices, non_image_indices
+        ]
+        final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[
+            batch_indices, non_image_indices
+        ]
         if labels is not None:
-            final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
+            final_labels[batch_indices, text_to_overwrite] = labels[
+                batch_indices, non_image_indices
+            ]
 
         # 5. Fill the embeddings corresponding to the images. Anything that is still zeros needs filling
         image_to_overwrite = torch.all(final_embedding == 0, dim=-1)
-        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[:, None].to(target_device)
+        image_to_overwrite &= image_to_overwrite.cumsum(-1) - 1 >= nb_image_pad[
+            :, None
+        ].to(target_device)
 
         if image_to_overwrite.sum() != image_features.shape[:-1].numel():
             raise ValueError(
@@ -482,9 +563,13 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 f" the number of image given to the model is {num_images}. This prevents correct indexing and breaks batch generation."
             )
 
-        final_embedding[image_to_overwrite] = image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+        final_embedding[image_to_overwrite] = (
+            image_features.contiguous().reshape(-1, embed_dim).to(target_device)
+        )
         final_attention_mask |= image_to_overwrite
-        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_((final_attention_mask == 0), 1)
+        position_ids = (final_attention_mask.cumsum(-1) - 1).masked_fill_(
+            (final_attention_mask == 0), 1
+        )
 
         # 6. Mask out the embedding at padding positions, as we later use the past_key_value value to determine the non-attended tokens.
         batch_indices, pad_indices = torch.where(input_ids == self.pad_token_id)
@@ -495,58 +580,79 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         if labels is None:
             final_labels = None
 
-        return final_embedding, final_attention_mask, final_labels, position_ids, text_to_overwrite
-    
-    def find_covered_patches(self, img_height, img_width, bbox, patch_size=14, grid_size=24):
-        scale_x = 336 / img_width
-        scale_y = 336 / img_height
-        bbox_scaled = [bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y]
+        return (
+            final_embedding,
+            final_attention_mask,
+            final_labels,
+            position_ids,
+            text_to_overwrite,
+        )
 
-        left_patch = int(bbox_scaled[0] // patch_size)
-        top_patch = int(bbox_scaled[1] // patch_size)
-        right_patch = int(bbox_scaled[2] // patch_size)
-        bottom_patch = int(bbox_scaled[3] // patch_size)
+    def find_covered_patches(
+        self, img_height, img_width, bbox, patch_size=14, grid_size=24
+    ):
+        convered_patches_list = []
 
-        left_patch = max(0, left_patch)
-        top_patch = max(0, top_patch)
-        right_patch = min(grid_size - 1, right_patch)
-        bottom_patch = min(grid_size - 1, bottom_patch)
+        for box in bbox:
+            scale_x = 336 / img_width
+            scale_y = 336 / img_height
+            bbox_scaled = [
+                box[0] * scale_x,
+                box[1] * scale_y,
+                box[2] * scale_x,
+                box[3] * scale_y,
+            ]
 
-        covered_patches = []
-        for y in range(top_patch, bottom_patch + 1):
-            for x in range(left_patch, right_patch + 1):
-                covered_patches.append(y * grid_size + x)
+            left_patch = int(bbox_scaled[0] // patch_size)
+            top_patch = int(bbox_scaled[1] // patch_size)
+            right_patch = int(bbox_scaled[2] // patch_size)
+            bottom_patch = int(bbox_scaled[3] // patch_size)
 
-        return covered_patches
-    
+            left_patch = max(0, left_patch)
+            top_patch = max(0, top_patch)
+            right_patch = min(grid_size - 1, right_patch)
+            bottom_patch = min(grid_size - 1, bottom_patch)
+
+            covered_patches = []
+            for y in range(top_patch, bottom_patch + 1):
+                for x in range(left_patch, right_patch + 1):
+                    covered_patches.append(y * grid_size + x)
+            convered_patches_list.append(covered_patches)
+        return convered_patches_list
+
     def find_covered_patches_arbitrary(self, img_height, img_width, bbox, M, N):
-    # Calculate the size of each patch based on the new grid dimensions
-        patch_size_x = img_width / N
-        patch_size_y = img_height / M
+        # Calculate the size of each patch based on the new grid dimensions
+        covered_patches_list = []
 
-        # Scale the bbox to the grid
-        left_patch = int(bbox[0] // patch_size_x)
-        top_patch = int(bbox[1] // patch_size_y)
-        right_patch = int(bbox[2] // patch_size_x)
-        bottom_patch = int(bbox[3] // patch_size_y)
+        for box in bbox:
+            patch_size_x = img_width / N
+            patch_size_y = img_height / M
 
-        # Ensure the patches are within the grid boundaries
-        left_patch = max(0, left_patch)
-        top_patch = max(0, top_patch)
-        right_patch = min(N - 1, right_patch)
-        bottom_patch = min(M - 1, bottom_patch)
+            # Scale the box to the grid
+            left_patch = int(box[0] // patch_size_x)
+            top_patch = int(box[1] // patch_size_y)
+            right_patch = int(box[2] // patch_size_x)
+            bottom_patch = int(box[3] // patch_size_y)
 
-        covered_patches = []
-        # Generate the list of covered patches based on the scaled bbox
-        for y in range(top_patch, bottom_patch + 1):
-            for x in range(left_patch, right_patch + 1):
-                covered_patches.append(y * N + x)
+            # Ensure the patches are within the grid boundaries
+            left_patch = max(0, left_patch)
+            top_patch = max(0, top_patch)
+            right_patch = min(N - 1, right_patch)
+            bottom_patch = min(M - 1, bottom_patch)
 
-        return covered_patches
+            covered_patches = []
+            # Generate the list of covered patches based on the scaled bbox
+            for y in range(top_patch, bottom_patch + 1):
+                for x in range(left_patch, right_patch + 1):
+                    covered_patches.append(y * N + x)
+            covered_patches_list.append(covered_patches)
 
-    
+        return covered_patches_list
+
     @add_start_docstrings_to_model_forward(LLAVA_NEXT_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=LlavaNextCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @replace_return_docstrings(
+        output_type=LlavaNextCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC
+    )
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -595,23 +701,36 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         "[INST]  \nWhat is shown in this image? [/INST] The image appears to be a radar chart, which is a type of multi-dimensional plot (...)"
         ```"""
 
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
         vision_feature_layer = (
-            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+            vision_feature_layer
+            if vision_feature_layer is not None
+            else self.config.vision_feature_layer
         )
         vision_feature_select_strategy = (
             vision_feature_select_strategy
             if vision_feature_select_strategy is not None
             else self.config.vision_feature_select_strategy
         )
-        
+
+        if PER_OBJECT_CONFIG.text_preprocess.decode(input_ids[-1]):
+            PER_OBJECT_CONFIG.is_write = False
+
         text_to_over_write = None
         ## TODO: add base_image_feature_size to one of the func
-        base_image_feature_size = None
+        # base_image_feature_size = None
         PER_OBJECT_CONFIG.generated_token += 1
         if inputs_embeds is None:
             # 1. Extract the input embeddings
@@ -619,11 +738,19 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
 
             # 2. Merge text and images
             if pixel_values is not None and input_ids.shape[1] != 1:
-                batch_size, num_patches, num_channels, height, width = pixel_values.shape
-                reshaped_pixel_values = pixel_values.view(batch_size * num_patches, num_channels, height, width)
-                image_features = self.vision_tower(reshaped_pixel_values, output_hidden_states=True)
+                batch_size, num_patches, num_channels, height, width = (
+                    pixel_values.shape
+                )
+                reshaped_pixel_values = pixel_values.view(
+                    batch_size * num_patches, num_channels, height, width
+                )
+                image_features = self.vision_tower(
+                    reshaped_pixel_values, output_hidden_states=True
+                )
 
-                selected_image_feature = image_features.hidden_states[vision_feature_layer]
+                selected_image_feature = image_features.hidden_states[
+                    vision_feature_layer
+                ]
 
                 if vision_feature_select_strategy == "default":
                     selected_image_feature = selected_image_feature[:, 1:]
@@ -639,60 +766,97 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 image_features = torch.split(image_features, split_sizes, dim=0)
 
                 # NOTE we only support multimodal_patch_merge_type == "spatial_unpad"
-                height = width = self.config.vision_config.image_size // self.config.vision_config.patch_size
+                height = width = (
+                    self.config.vision_config.image_size
+                    // self.config.vision_config.patch_size
+                )
 
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:
                         base_image_feature = image_feature[0]
-                        base_image_feature_size = base_image_feature.shape
+                        # base_image_feature_size = base_image_feature.shape
                         image_feature = image_feature[1:]
 
                         if height * width != base_image_feature.shape[0]:
-                            raise ValueError("The number of patches is not consistent with the image size.")
+                            raise ValueError(
+                                "The number of patches is not consistent with the image size."
+                            )
                         num_patch_height, num_patch_width = get_anyres_image_grid_shape(
                             image_sizes[image_idx],
                             self.config.image_grid_pinpoints,
                             self.config.vision_config.image_size,
                         )
-                        image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
-                        image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                        image_feature = image_feature.view(
+                            num_patch_height, num_patch_width, height, width, -1
+                        )
+                        image_feature = image_feature.permute(
+                            4, 0, 2, 1, 3
+                        ).contiguous()
                         image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                        image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                        image_feature = unpad_image(
+                            image_feature, image_sizes[image_idx]
+                        )
                         image_feature = torch.cat(
                             (
                                 image_feature,
-                                self.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1),
+                                self.image_newline[:, None, None].expand(
+                                    *image_feature.shape[:-1], 1
+                                ),
                             ),
                             dim=-1,
                         )
-                        PER_OBJECT_CONFIG.high_resolution_image_feature_height = image_feature.shape[1]
-                        PER_OBJECT_CONFIG.high_resolution_image_feature_width = image_feature.shape[2]
+                        PER_OBJECT_CONFIG.high_resolution_image_feature_height = (
+                            image_feature.shape[1]
+                        )
+                        PER_OBJECT_CONFIG.high_resolution_image_feature_width = (
+                            image_feature.shape[2]
+                        )
                         image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        PER_OBJECT_CONFIG.base_image_offset = base_image_feature.shape[0]
-                        image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+                        PER_OBJECT_CONFIG.base_image_offset = base_image_feature.shape[
+                            0
+                        ]
+                        image_feature = torch.cat(
+                            (base_image_feature, image_feature), dim=0
+                        )
                     else:
                         image_feature = image_feature[0]
-                        image_feature = torch.cat((image_feature, self.image_newline[None]), dim=0)
+                        image_feature = torch.cat(
+                            (image_feature, self.image_newline[None]), dim=0
+                        )
                     new_image_features.append(image_feature)
                 image_features = torch.stack(new_image_features, dim=0)
 
-                inputs_embeds, attention_mask, labels, position_ids, text_to_over_write_out = self._merge_input_ids_with_image_features(
+                (
+                    inputs_embeds,
+                    attention_mask,
+                    labels,
+                    position_ids,
+                    text_to_over_write_out,
+                ) = self._merge_input_ids_with_image_features(
                     image_features, inputs_embeds, input_ids, attention_mask, labels
                 )
                 text_to_over_write = text_to_over_write_out
                 if labels is None:
-                    labels = torch.full_like(attention_mask, self.config.ignore_index).to(torch.long)
+                    labels = torch.full_like(
+                        attention_mask, self.config.ignore_index
+                    ).to(torch.long)
 
             # In case input_ids.shape[1] == 1 & pixel_values==None & past_key_values != None, we are in the case of
             # generation with cache
-            elif past_key_values is not None and pixel_values is not None and input_ids.shape[1] == 1:
+            elif (
+                past_key_values is not None
+                and pixel_values is not None
+                and input_ids.shape[1] == 1
+            ):
                 # Retrieve the first layer to inspect the logits and mask out the hidden states
                 # that are set to 0
                 first_layer_past_key_value = past_key_values[0][0][:, :, :, 0]
 
                 # Sum all dimensions of head_dim (-2) to avoid random errors such as: https://github.com/huggingface/transformers/pull/28032#issuecomment-1863691941
-                batch_index, non_attended_tokens = torch.where(first_layer_past_key_value.float().sum(-2) == 0)
+                batch_index, non_attended_tokens = torch.where(
+                    first_layer_past_key_value.float().sum(-2) == 0
+                )
 
                 # Get the target length
                 target_seqlen = first_layer_past_key_value.shape[-1] + 1
@@ -713,25 +877,29 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 # Zero-out the places where we don't need to attend
                 extended_attention_mask[new_batch_index, new_non_attended_tokens] = 0
 
-                attention_mask = torch.cat((attention_mask, extended_attention_mask), dim=1)
+                attention_mask = torch.cat(
+                    (attention_mask, extended_attention_mask), dim=1
+                )
                 position_ids = torch.sum(attention_mask, dim=1).unsqueeze(-1) - 1
 
-        selected_patches_for_base = self.find_covered_patches(
-            PER_OBJECT_CONFIG.image_height, 
+        selected_patches_for_base_list = self.find_covered_patches(
+            PER_OBJECT_CONFIG.image_height,
             PER_OBJECT_CONFIG.image_width,
             PER_OBJECT_CONFIG.bbox,
             patch_size=14,
-            grid_size=24
+            grid_size=24,
         )
-        selected_patches_for_hd = self.find_covered_patches_arbitrary(
-            PER_OBJECT_CONFIG.image_height, 
+        selected_patches_for_hd_list = self.find_covered_patches_arbitrary(
+            PER_OBJECT_CONFIG.image_height,
             PER_OBJECT_CONFIG.image_width,
             PER_OBJECT_CONFIG.bbox,
             PER_OBJECT_CONFIG.high_resolution_image_feature_height,
-            PER_OBJECT_CONFIG.high_resolution_image_feature_width
+            PER_OBJECT_CONFIG.high_resolution_image_feature_width,
         )
-        PER_OBJECT_CONFIG.selected_patches_for_base = selected_patches_for_base
-        PER_OBJECT_CONFIG.selected_patches_for_hd = selected_patches_for_hd
+        PER_OBJECT_CONFIG.selected_patches_for_base_list = (
+            selected_patches_for_base_list
+        )
+        PER_OBJECT_CONFIG.selected_patches_for_hd_list = selected_patches_for_hd_list
 
         outputs = self.language_model(
             attention_mask=attention_mask,
@@ -745,189 +913,299 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         )
         if text_to_over_write is not None:
             text_to_over_write = text_to_over_write.detach().cpu()
-            PER_OBJECT_CONFIG.text_to_over_write  = text_to_over_write
+            PER_OBJECT_CONFIG.text_to_over_write = text_to_over_write
         else:
             text_to_over_write = PER_OBJECT_CONFIG.text_to_over_write
         # get the logits
         logits = outputs[0]
-        logits_need_to_be_saved = logits[:, -1, :].detach().cpu() # [b, 1, 32064]
+        logits_need_to_be_saved = logits[:, -1, :].detach().cpu()  # [b, 1, 32064]
         logits_entropy = self.get_entropy(torch.softmax(logits_need_to_be_saved, dim=1))
         logits_entropy = logits_entropy.item()
         output_path = PER_OBJECT_CONFIG.output_path
         output_image_name = PER_OBJECT_CONFIG.filename
         obj_id = PER_OBJECT_CONFIG.obj_id
         # save the logits
-        genereated_token = PER_OBJECT_CONFIG.generated_token
-        save_logits_path = os.path.join(output_path, 
-                                        output_image_name,
-                                        f"obj_id{obj_id}",
-                                        f"{genereated_token}",
-                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_logits.npy")
-        os.makedirs(os.path.dirname(save_logits_path), exist_ok=True)
-        np.save(save_logits_path, logits_need_to_be_saved.numpy())
-        
-        metrics = {
-            "logits_entropy": logits_entropy,
-            "number_of_text_tokens": text_to_over_write.shape[0],
-        }
-        save_json_path = os.path.join(output_path,
-                                output_image_name,
-                                f"obj_id{obj_id}",
-                                f"{genereated_token}",
-                                f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json")
-        os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
-        # get the attention weights
-        if outputs.attentions:
-            attention_weights = outputs.attentions
-            attention_list = None
-            # Use list comprehension to gather the last column of attention weights for each layer
-            if PER_OBJECT_CONFIG.is_seven_billion:
-                attention_list = [layer[:, :, -1, :].cpu() for layer in attention_weights]
-            else:
-                attention_list = [layer[:, :, -1, :] for layer in attention_weights]
-            number_layer = len(attention_list)
-            number_head = attention_list[0].shape[1]
-            del outputs.attentions
-            outputs.attentions = None
-            torch.cuda.empty_cache()
-        
-            # Concatenate the list of tensors along the first dimension
-            # Note: It's more efficient to call .detach().cpu() after concatenation to minimize data movement
-            attention_list_concat = torch.concat(attention_list, dim=0)
-            # get attention metric per unit visual token and text token for the last token
-            # visual text attention ratio
-            image_attention_sum, text_attention_sum, image_attention_average, text_attention_average, visual_attention_per_head_per_layer = self.calculate_vtr(attention_list_concat, text_to_over_write)
-            # Per Unit Attention hit
-            base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd = self.calculate_pua(visual_attention_per_head_per_layer, selected_patches_for_base, selected_patches_for_hd)
-            # save the attention weights
-            save_attention_weights_path = os.path.join(output_path,
-                                                        output_image_name,
-                                                        f"obj_id{obj_id}",
-                                                        f"{genereated_token}",
-                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_weights.npy")
-            os.makedirs(os.path.dirname(save_attention_weights_path), exist_ok=True)
-            np.save(save_attention_weights_path, attention_list_concat.numpy())
-            # save a json file for other metrics: logits_entropy
+
+        if PER_OBJECT_CONFIG.is_write:
+            genereated_token = PER_OBJECT_CONFIG.generated_token
+            save_logits_path = os.path.join(
+                output_path,
+                output_image_name,
+                f"obj_id{obj_id}",
+                f"{genereated_token}",
+                f"obj_id_{obj_id}_generated_token_{genereated_token}_logits.npy",
+            )
+            os.makedirs(os.path.dirname(save_logits_path), exist_ok=True)
+            np.save(save_logits_path, logits_need_to_be_saved.numpy())
+
             metrics = {
                 "logits_entropy": logits_entropy,
-                "image_attention_sum": torch.sum(image_attention_sum).item(),
-                "text_attention_sum": torch.sum(text_attention_sum).item(),
-                "image_attention_average": torch.sum(image_attention_average).item(),
-                "text_attention_average": torch.sum(text_attention_average).item(),
-                "base_hit_per_layer_per_head": torch.sum(base_hit_per_layer_per_head).item(),
-                "hd_hit_per_layer_per_head": torch.sum(hd_hit_per_layer_per_head).item(),
-                "entropy_base": torch.sum(entropy_base).item(),
-                "entropy_hd": torch.sum(entropy_hd).item(),
-                "entropy_visual_attention": torch.sum(entropy_visual_attention).item(),
-                "kl_base": torch.sum(kl_base).item(),
-                "kl_hd": torch.sum(kl_hd).item(),
-                "header": number_head,
-                "layers": number_layer,
                 "number_of_text_tokens": text_to_over_write.shape[0],
-                "number_of_visual_tokens": visual_attention_per_head_per_layer.shape[2],
             }
-            save_json_path = os.path.join(output_path,
-                                            output_image_name,
-                                            f"obj_id{obj_id}",
-                                            f"{genereated_token}",
-                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json")
+            save_json_path = os.path.join(
+                output_path,
+                output_image_name,
+                f"obj_id{obj_id}",
+                f"{genereated_token}",
+                f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json",
+            )
             os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
-            with open(save_json_path, 'w') as f:
-                json.dump(metrics, f)
-            # save image_attention_sum, text_attention_sum, image_attention_average, text_attention_average
-            save_attention_sum_path = os.path.join(output_path,
-                                                    output_image_name,
-                                                    f"obj_id{obj_id}",
-                                                    f"{genereated_token}",
-                                                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_sum.npy")
-            os.makedirs(os.path.dirname(save_attention_sum_path), exist_ok=True)
-            np.save(save_attention_sum_path, image_attention_sum.numpy())
-            save_text_attention_sum_path = os.path.join(output_path,
-                                                        output_image_name,
-                                                        f"obj_id{obj_id}",
-                                                        f"{genereated_token}",
-                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_sum.npy")
-            os.makedirs(os.path.dirname(save_text_attention_sum_path), exist_ok=True)
-            np.save(save_text_attention_sum_path, text_attention_sum.numpy())
-            save_attention_average_path = os.path.join(output_path,
-                                                        output_image_name,
-                                                        f"obj_id{obj_id}",
-                                                        f"{genereated_token}",
-                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_average.npy")
-            os.makedirs(os.path.dirname(save_attention_average_path), exist_ok=True)
-            np.save(save_attention_average_path, image_attention_average.numpy())
-            save_text_attention_average_path = os.path.join(output_path,
-                                                            output_image_name,
-                                                            f"obj_id{obj_id}",
-                                                            f"{genereated_token}",
-                                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_average.npy")
-            os.makedirs(os.path.dirname(save_text_attention_average_path), exist_ok=True)
-            np.save(save_text_attention_average_path, text_attention_average.numpy())
-            # save base_hit_per_layer_per_head, hd_hit_per_layer_per_head, entropy_base, entropy_hd, entropy_visual_attention, kl_base, kl_hd
-            save_base_hit_per_layer_per_head_path = os.path.join(output_path,
-                                                                output_image_name,
-                                                                f"obj_id{obj_id}",
-                                                                f"{genereated_token}",
-                                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_base_hit_per_layer_per_head.npy")
-            os.makedirs(os.path.dirname(save_base_hit_per_layer_per_head_path), exist_ok=True)
-            np.save(save_base_hit_per_layer_per_head_path, base_hit_per_layer_per_head.numpy())
-            save_hd_hit_per_layer_per_head_path = os.path.join(output_path,
-                                                                output_image_name,
-                                                                f"obj_id{obj_id}",
-                                                                f"{genereated_token}",
-                                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head.npy")
-            os.makedirs(os.path.dirname(save_hd_hit_per_layer_per_head_path), exist_ok=True)
-            np.save(save_hd_hit_per_layer_per_head_path, hd_hit_per_layer_per_head.numpy())
-            save_entropy_base_path = os.path.join(output_path,
-                                                output_image_name,
-                                                f"obj_id{obj_id}",
-                                                f"{genereated_token}",
-                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_base.npy")
-            os.makedirs(os.path.dirname(save_entropy_base_path), exist_ok=True)
-            np.save(save_entropy_base_path, entropy_base.numpy())
-            save_entropy_hd_path = os.path.join(output_path,
-                                                output_image_name,
-                                                f"obj_id{obj_id}",
-                                                f"{genereated_token}",
-                                                f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_hd.npy")
-            os.makedirs(os.path.dirname(save_entropy_hd_path), exist_ok=True)
-            np.save(save_entropy_hd_path, entropy_hd.numpy())
-            entropy_visual_attention_path = os.path.join(output_path,
-                                                        output_image_name,
-                                                        f"obj_id{obj_id}",
-                                                        f"{genereated_token}",
-                                                        f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_visual_attention.npy")
-            os.makedirs(os.path.dirname(entropy_visual_attention_path), exist_ok=True)
-            np.save(entropy_visual_attention_path, entropy_visual_attention.numpy())
-            save_kl_base_path = os.path.join(output_path,
-                                            output_image_name,
-                                            f"obj_id{obj_id}",
-                                            f"{genereated_token}",
-                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_base.npy")
-            os.makedirs(os.path.dirname(save_kl_base_path), exist_ok=True)
-            np.save(save_kl_base_path, kl_base.numpy())
-            save_kl_hd_path = os.path.join(output_path,
-                                            output_image_name,
-                                            f"obj_id{obj_id}",
-                                            f"{genereated_token}",
-                                            f"obj_id_{obj_id}_generated_token_{genereated_token}_kl_hd.npy")
-            os.makedirs(os.path.dirname(save_kl_hd_path), exist_ok=True)
-            np.save(save_kl_hd_path, kl_hd.numpy()) 
-        
+            # get the attention weights
+            if outputs.attentions:
+                attention_weights = outputs.attentions
+                attention_list = None
+                # Use list comprehension to gather the last column of attention weights for each layer
+                if PER_OBJECT_CONFIG.is_seven_billion:
+                    attention_list = [
+                        layer[:, :, -1, :].cpu() for layer in attention_weights
+                    ]
+                else:
+                    attention_list = [layer[:, :, -1, :] for layer in attention_weights]
+                number_layer = len(attention_list)
+                number_head = attention_list[0].shape[1]
+                del outputs.attentions
+                outputs.attentions = None
+                torch.cuda.empty_cache()
+
+                # Concatenate the list of tensors along the first dimension
+                # Note: It's more efficient to call .detach().cpu() after concatenation to minimize data movement
+                attention_list_concat = torch.concat(attention_list, dim=0)
+                # get attention metric per unit visual token and text token for the last token
+                # visual text attention ratio
+                (
+                    image_attention_sum,
+                    text_attention_sum,
+                    image_attention_average,
+                    text_attention_average,
+                    visual_attention_per_head_per_layer,
+                ) = self.calculate_vtr(attention_list_concat, text_to_over_write)
+                # Per Unit Attention hit
+                (
+                    base_hit_per_layer_per_head_list,
+                    hd_hit_per_layer_per_head_list,
+                    entropy_base,
+                    entropy_hd,
+                    entropy_visual_attention,
+                    length_patch_base,
+                    length_patch_hd,
+                ) = self.calculate_pua(
+                    visual_attention_per_head_per_layer,
+                    selected_patches_for_base_list,
+                    selected_patches_for_hd_list,
+                )
+                # save the attention weights
+                save_attention_weights_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_attention_weights.npy",
+                )
+                os.makedirs(os.path.dirname(save_attention_weights_path), exist_ok=True)
+                np.save(save_attention_weights_path, attention_list_concat.numpy())
+                # save a json file for other metrics: logits_entropy
+                metrics = {
+                    "logits_entropy": logits_entropy,
+                    "image_attention_sum": torch.sum(image_attention_sum).item(),
+                    "text_attention_sum": torch.sum(text_attention_sum).item(),
+                    "image_attention_average": torch.sum(
+                        image_attention_average
+                    ).item(),
+                    "text_attention_average": torch.sum(text_attention_average).item(),
+                    "base_hit_per_layer_per_head_bbox_1": torch.sum(
+                        base_hit_per_layer_per_head_list[0]
+                    ).item(),
+                    "base_hit_per_layer_per_head_bbox_2": torch.sum(
+                        base_hit_per_layer_per_head_list[1]
+                    ).item(),
+                    "base_hit_per_layer_per_head_bbox_3": torch.sum(
+                        base_hit_per_layer_per_head_list[2]
+                    ).item(),
+                    "base_hit_per_layer_per_head_bbox_4": torch.sum(
+                        base_hit_per_layer_per_head_list[3]
+                    ).item(),
+                    "base_hit_per_layer_per_head_bbox_5": torch.sum(
+                        base_hit_per_layer_per_head_list[4]
+                    ).item(),
+                    "hd_hit_per_layer_per_head_bbox_1": torch.sum(
+                        hd_hit_per_layer_per_head_list[0]
+                    ).item(),
+                    "hd_hit_per_layer_per_head_bbox_2": torch.sum(
+                        hd_hit_per_layer_per_head_list[1]
+                    ).item(),
+                    "hd_hit_per_layer_per_head_bbox_3": torch.sum(
+                        hd_hit_per_layer_per_head_list[2]
+                    ).item(),
+                    "hd_hit_per_layer_per_head_bbox_4": torch.sum(
+                        hd_hit_per_layer_per_head_list[3]
+                    ).item(),
+                    "hd_hit_per_layer_per_head_bbox_5": torch.sum(
+                        hd_hit_per_layer_per_head_list[4]
+                    ).item(),
+                    "entropy_base": torch.sum(entropy_base).item(),
+                    "entropy_hd": torch.sum(entropy_hd).item(),
+                    "entropy_visual_attention": torch.sum(
+                        entropy_visual_attention
+                    ).item(),
+                    "length_patch_base": length_patch_base,
+                    "length_patch_hd": length_patch_hd,
+                    "header": number_head,
+                    "layers": number_layer,
+                    "number_of_text_tokens": text_to_over_write.shape[0],
+                    "number_of_visual_tokens": visual_attention_per_head_per_layer.shape[
+                        2
+                    ],
+                }
+                save_json_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_metrics.json",
+                )
+                os.makedirs(os.path.dirname(save_json_path), exist_ok=True)
+                with open(save_json_path, "w") as f:
+                    json.dump(metrics, f)
+                # save image_attention_sum, text_attention_sum, image_attention_average, text_attention_average
+                save_attention_sum_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_image_attention_sum.npy",
+                )
+                os.makedirs(os.path.dirname(save_attention_sum_path), exist_ok=True)
+                np.save(save_attention_sum_path, image_attention_sum.numpy())
+                save_text_attention_sum_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_sum.npy",
+                )
+                os.makedirs(
+                    os.path.dirname(save_text_attention_sum_path), exist_ok=True
+                )
+                np.save(save_text_attention_sum_path, text_attention_sum.numpy())
+                save_attention_average_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_image_attention_average.npy",
+                )
+                os.makedirs(os.path.dirname(save_attention_average_path), exist_ok=True)
+                np.save(save_attention_average_path, image_attention_average.numpy())
+                save_text_attention_average_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_text_attention_average.npy",
+                )
+                os.makedirs(
+                    os.path.dirname(save_text_attention_average_path), exist_ok=True
+                )
+                np.save(
+                    save_text_attention_average_path, text_attention_average.numpy()
+                )
+
+                for bbox_id in range(5):
+                    save_base_hit_per_layer_per_head_path = os.path.join(
+                        output_path,
+                        output_image_name,
+                        f"obj_id{obj_id}",
+                        f"{genereated_token}",
+                        f"obj_id_{obj_id}_generated_token_{genereated_token}_base_hit_per_layer_per_head_bbox_id_{bbox_id}.npy",
+                    )
+                    os.makedirs(
+                        os.path.dirname(save_base_hit_per_layer_per_head_path),
+                        exist_ok=True,
+                    )
+                    np.save(
+                        save_base_hit_per_layer_per_head_path,
+                        base_hit_per_layer_per_head_list[bbox_id].numpy(),
+                    )
+
+                for bbox_id in range(5):
+                    save_hd_hit_per_layer_per_head_path = os.path.join(
+                        output_path,
+                        output_image_name,
+                        f"obj_id{obj_id}",
+                        f"{genereated_token}",
+                        f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head_bbox_id_{bbox_id}.npy",
+                    )
+                    os.makedirs(
+                        os.path.dirname(save_hd_hit_per_layer_per_head_path),
+                        exist_ok=True,
+                    )
+                    np.save(
+                        save_hd_hit_per_layer_per_head_path,
+                        hd_hit_per_layer_per_head_list[bbox_id].numpy(),
+                    )
+                save_hd_hit_per_layer_per_head_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head.npy",
+                )
+                os.makedirs(
+                    os.path.dirname(save_hd_hit_per_layer_per_head_path), exist_ok=True
+                )
+                np.save(
+                    save_hd_hit_per_layer_per_head_path,
+                    hd_hit_per_layer_per_head.numpy(),
+                )
+                save_entropy_base_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_base.npy",
+                )
+                os.makedirs(os.path.dirname(save_entropy_base_path), exist_ok=True)
+                np.save(save_entropy_base_path, entropy_base.numpy())
+                save_entropy_hd_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_hd.npy",
+                )
+                os.makedirs(os.path.dirname(save_entropy_hd_path), exist_ok=True)
+                np.save(save_entropy_hd_path, entropy_hd.numpy())
+                entropy_visual_attention_path = os.path.join(
+                    output_path,
+                    output_image_name,
+                    f"obj_id{obj_id}",
+                    f"{genereated_token}",
+                    f"obj_id_{obj_id}_generated_token_{genereated_token}_entropy_visual_attention.npy",
+                )
+                os.makedirs(
+                    os.path.dirname(entropy_visual_attention_path), exist_ok=True
+                )
+                np.save(entropy_visual_attention_path, entropy_visual_attention.numpy())
+
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
             if attention_mask is not None:
                 shift_attention_mask = attention_mask[..., 1:]
-                shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()
-                shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
+                shift_logits = logits[..., :-1, :][
+                    shift_attention_mask.to(logits.device) != 0
+                ].contiguous()
+                shift_labels = labels[..., 1:][
+                    shift_attention_mask.to(labels.device) != 0
+                ].contiguous()
             else:
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1).to(shift_logits.device),
             )
 
         if not return_dict:
@@ -963,7 +1241,10 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
             # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
             # input)
-            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+            if (
+                attention_mask is not None
+                and attention_mask.shape[1] > input_ids.shape[1]
+            ):
                 input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
             # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
             # input_ids based on the past_length.
@@ -975,7 +1256,9 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             # If the cache has seen more tokens than it can hold, then the cache has a size limit. Let's discard the
             # older attention values, as their corresponding values are not part of the input.
             if cache_length < past_length and attention_mask is not None:
-                attention_mask = attention_mask[:, -(cache_length + input_ids.shape[1]) :]
+                attention_mask = attention_mask[
+                    :, -(cache_length + input_ids.shape[1]) :
+                ]
 
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
