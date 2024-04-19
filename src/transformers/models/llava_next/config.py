@@ -17,11 +17,14 @@ class Global_Config:
     text_to_over_write = None
     base_image_offset = -1
     system_prompt_offset = -1
-    is_seven_billion = True
+    is_seven_billion = False
     scale_down_factor = 0.75
     scale_up_factor = 1.35
     is_write = True
     text_preprocess = None
+    inputs_shape_dim_1 = -1
+    correct_prediction = -1
+    is_single_turn = False
 
 
 PER_OBJECT_CONFIG = Global_Config()

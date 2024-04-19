@@ -39,6 +39,8 @@ import torch.nn.functional as F
 import numpy as np
 import json
 
+PER_OBJECT_CONFIG.is_write = True
+
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlavaNextConfig"
@@ -382,8 +384,7 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
         selected_patches_for_base_list,
         selected_patches_for_hd_list,
     ):
-
-        average_visual_attention = 1 / visual_attention_per_head_per_layer.shape[2]
+        # average_visual_attention = 1 / visual_attention_per_head_per_layer.shape[2]
         softmax_visual_attention_per_head_per_layer = torch.softmax(
             visual_attention_per_head_per_layer, dim=-1
         )
@@ -394,24 +395,65 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
 
         base_hit_per_layer_per_head_list = []
         hd_hit_per_layer_per_head_list = []
+        all_selected_patches_base = set()
+        all_selected_patches_hd = set()
 
         for selected_patches_for_base, selected_patches_for_hd in zip(
             selected_patches_for_base_list, selected_patches_for_hd_list
         ):
             base_hit_per_layer_per_head = torch.sum(
-                softmax_base_image_attention[:, :, selected_patches_for_base]
-                > average_visual_attention,
+                softmax_base_image_attention[:, :, selected_patches_for_base],
                 dim=2,
                 keepdim=True,
             )
             hd_hit_per_layer_per_head = torch.sum(
-                softmax_hd_attention[:, :, selected_patches_for_hd]
-                > average_visual_attention,
+                softmax_hd_attention[:, :, selected_patches_for_hd],
                 dim=2,
                 keepdim=True,
             )
             base_hit_per_layer_per_head_list.append(base_hit_per_layer_per_head)
             hd_hit_per_layer_per_head_list.append(hd_hit_per_layer_per_head)
+            # Collecting indices of selected patches
+            all_selected_patches_base.update(selected_patches_for_base)
+            all_selected_patches_hd.update(selected_patches_for_hd)
+
+        # Convert the combined set to tensor for indexing
+        all_selected_patches_base_tensor = torch.tensor(
+            list(all_selected_patches_base), dtype=torch.long
+        )
+
+        all_selected_patches_hd_tensor = torch.tensor(
+            list(all_selected_patches_hd), dtype=torch.long
+        )
+
+        # Create a mask for remaining patches
+        softmax_base_image_attention_patches = softmax_base_image_attention.shape[
+            2
+        ]  # Assuming the shape of your attention tensor
+        remaining_patches_mask_base = torch.ones(
+            softmax_base_image_attention_patches, dtype=torch.bool
+        )
+        remaining_patches_mask_base[all_selected_patches_base_tensor] = False
+
+        softmax_hd_image_attention_patches = softmax_hd_attention.shape[
+            2
+        ]  # Assuming the shape of your attention tensor
+        remaining_patches_mask_hd = torch.ones(
+            softmax_hd_image_attention_patches, dtype=torch.bool
+        )
+        remaining_patches_mask_hd[all_selected_patches_hd_tensor] = False
+
+        # Calculate attention for remaining patches
+        remaining_base_attention = torch.sum(
+            softmax_base_image_attention[:, :, remaining_patches_mask_base],
+            dim=2,
+            keepdim=True,
+        )
+        remaining_hd_attention = torch.sum(
+            softmax_hd_attention[:, :, remaining_patches_mask_hd],
+            dim=2,
+            keepdim=True,
+        )
 
         entropy_base = self.get_entropy(softmax_base_image_attention)
         entropy_hd = self.get_entropy(softmax_hd_attention)
@@ -436,36 +478,67 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             entropy_visual_attention,
             length_patch_base,
             length_patch_hd,
+            remaining_base_attention,
+            remaining_hd_attention,
         )
 
     def calculate_vtr(self, x, text_to_over_write):
         # x: 32 * 32 * N
-        x = torch.softmax(x.float(), dim=-1)
+        softmax_x = torch.softmax(x.float(), dim=-1)
         text_attention_per_head_per_layer = x[:, :, text_to_over_write]
         mask = torch.ones(x.shape[2], dtype=torch.bool)
         mask[text_to_over_write] = False
         visual_attention_per_head_per_layer = x[:, :, mask]
+        text_attention_per_head_per_layer_softmax = softmax_x[:, :, text_to_over_write]
+        visual_attention_per_head_per_layer_softmax = softmax_x[:, :, mask]
 
         # Normalize to get proportions
         image_attention_sum = torch.sum(
-            visual_attention_per_head_per_layer, dim=-1, keepdim=True
+            visual_attention_per_head_per_layer_softmax, dim=-1, keepdim=True
         )
         image_attention_average = torch.mean(
-            visual_attention_per_head_per_layer, dim=-1, keepdim=True
+            visual_attention_per_head_per_layer_softmax, dim=-1, keepdim=True
         )
         text_attention_sum = torch.sum(
-            text_attention_per_head_per_layer, dim=-1, keepdim=True
+            text_attention_per_head_per_layer_softmax, dim=-1, keepdim=True
         )
         text_attention_average = torch.mean(
-            text_attention_per_head_per_layer, dim=-1, keepdim=True
+            text_attention_per_head_per_layer_softmax, dim=-1, keepdim=True
         )
+        start_index = PER_OBJECT_CONFIG.inputs_shape_dim_1 - 1
 
+        text_attention_per_head_per_layer_generated_part = None
+
+        if 0 <= start_index < text_attention_per_head_per_layer_softmax.shape[2]:
+            text_attention_per_head_per_layer_generated_part = (
+                text_attention_per_head_per_layer_softmax[:, :, start_index:]
+            )
+        else:
+            # Set to zero or some other neutral value
+            # Ensure the shape matches expected dimensions, here an example placeholder for the shape:
+            shape = text_attention_per_head_per_layer_softmax.shape
+            text_attention_per_head_per_layer_generated_part = torch.zeros(
+                shape[0],
+                shape[1],
+                max(0, shape[2] - start_index),
+                device=text_attention_per_head_per_layer_softmax.device,
+            )
+
+        text_attention_per_head_per_layer_generated_part_sum = torch.sum(
+            text_attention_per_head_per_layer_generated_part, dim=-1, keepdim=True
+        )
+        text_attention_per_head_per_layer_generated_part_average = torch.mean(
+            text_attention_per_head_per_layer_generated_part, dim=-1, keepdim=True
+        )
         return (
             image_attention_sum,
             text_attention_sum,
+            text_attention_per_head_per_layer_generated_part_sum,
             image_attention_average,
             text_attention_average,
-            visual_attention_per_head_per_layer,
+            text_attention_per_head_per_layer_generated_part_average,
+            visual_attention_per_head_per_layer.float(),
+            text_attention_per_head_per_layer.float(),
         )
 
     # Copied from transformers.models.llava.modeling_llava.LlavaForConditionalGeneration._merge_input_ids_with_image_features
@@ -725,11 +798,17 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             else self.config.vision_feature_select_strategy
         )
 
-        if PER_OBJECT_CONFIG.text_preprocess.decode(input_ids[-1]):
+        if (
+            PER_OBJECT_CONFIG.text_preprocess.decode(input_ids[:, -1]) == ","
+            or PER_OBJECT_CONFIG.text_preprocess.decode(input_ids[:, -1]) == " ,"
+        ):
             PER_OBJECT_CONFIG.is_write = False
 
+        if PER_OBJECT_CONFIG.is_single_turn:
+            PER_OBJECT_CONFIG.is_write = True
+
         text_to_over_write = None
-        ## TODO: add base_image_feature_size to one of the func
+        # TODO: add base_image_feature_size to one of the func
         # base_image_feature_size = None
         PER_OBJECT_CONFIG.generated_token += 1
         if inputs_embeds is None:
@@ -975,9 +1054,12 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                 (
                     image_attention_sum,
                     text_attention_sum,
+                    text_attention_generated_part_sum,
                     image_attention_average,
                     text_attention_average,
+                    text_attention_generated_part_average,
                     visual_attention_per_head_per_layer,
+                    text_attention_per_head_per_layer,
                 ) = self.calculate_vtr(attention_list_concat, text_to_over_write)
                 # Per Unit Attention hit
                 (
@@ -988,6 +1070,8 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                     entropy_visual_attention,
                     length_patch_base,
                     length_patch_hd,
+                    remaining_base_attention,
+                    remaining_hd_attention,
                 ) = self.calculate_pua(
                     visual_attention_per_head_per_layer,
                     selected_patches_for_base_list,
@@ -1012,36 +1096,52 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                         image_attention_average
                     ).item(),
                     "text_attention_average": torch.sum(text_attention_average).item(),
+                    "text_attention_generated_part_sum": torch.sum(
+                        text_attention_generated_part_sum
+                    ).item(),
+                    "text_attention_generated_part_average": torch.sum(
+                        text_attention_generated_part_average
+                    ).item(),
                     "base_hit_per_layer_per_head_bbox_1": torch.sum(
                         base_hit_per_layer_per_head_list[0]
-                    ).item(),
+                    ).item()
+                    / length_patch_base[0],
                     "base_hit_per_layer_per_head_bbox_2": torch.sum(
                         base_hit_per_layer_per_head_list[1]
-                    ).item(),
+                    ).item()
+                    / length_patch_base[1],
                     "base_hit_per_layer_per_head_bbox_3": torch.sum(
                         base_hit_per_layer_per_head_list[2]
-                    ).item(),
+                    ).item()
+                    / length_patch_base[2],
                     "base_hit_per_layer_per_head_bbox_4": torch.sum(
                         base_hit_per_layer_per_head_list[3]
-                    ).item(),
+                    ).item()
+                    / length_patch_base[3],
                     "base_hit_per_layer_per_head_bbox_5": torch.sum(
                         base_hit_per_layer_per_head_list[4]
-                    ).item(),
+                    ).item()
+                    / length_patch_base[4],
                     "hd_hit_per_layer_per_head_bbox_1": torch.sum(
                         hd_hit_per_layer_per_head_list[0]
-                    ).item(),
+                    ).item()
+                    / length_patch_hd[0],
                     "hd_hit_per_layer_per_head_bbox_2": torch.sum(
                         hd_hit_per_layer_per_head_list[1]
-                    ).item(),
+                    ).item()
+                    / length_patch_hd[1],
                     "hd_hit_per_layer_per_head_bbox_3": torch.sum(
                         hd_hit_per_layer_per_head_list[2]
-                    ).item(),
+                    ).item()
+                    / length_patch_hd[2],
                     "hd_hit_per_layer_per_head_bbox_4": torch.sum(
                         hd_hit_per_layer_per_head_list[3]
-                    ).item(),
+                    ).item()
+                    / length_patch_hd[3],
                     "hd_hit_per_layer_per_head_bbox_5": torch.sum(
                         hd_hit_per_layer_per_head_list[4]
-                    ).item(),
+                    ).item()
+                    / length_patch_hd[4],
                     "entropy_base": torch.sum(entropy_base).item(),
                     "entropy_hd": torch.sum(entropy_hd).item(),
                     "entropy_visual_attention": torch.sum(
@@ -1055,7 +1155,41 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                     "number_of_visual_tokens": visual_attention_per_head_per_layer.shape[
                         2
                     ],
+                    "remaining_base_attention": torch.sum(
+                        remaining_base_attention
+                    ).item(),
+                    "remaining_hd_attention": torch.sum(remaining_hd_attention).item(),
                 }
+                metrics["overall_visual_attention_per_layer_per_head_bbox_1"] = (
+                    metrics["base_hit_per_layer_per_head_bbox_1"]
+                    * metrics["length_patch_base"][0]
+                    + metrics["hd_hit_per_layer_per_head_bbox_1"]
+                    * metrics["length_patch_hd"][0]
+                )
+                metrics["overall_visual_attention_per_layer_per_head_bbox_2"] = (
+                    metrics["base_hit_per_layer_per_head_bbox_2"]
+                    * metrics["length_patch_base"][1]
+                    + metrics["hd_hit_per_layer_per_head_bbox_2"]
+                    * metrics["length_patch_hd"][1]
+                )
+                metrics["overall_visual_attention_per_layer_per_head_bbox_3"] = (
+                    metrics["base_hit_per_layer_per_head_bbox_3"]
+                    * metrics["length_patch_base"][2]
+                    + metrics["hd_hit_per_layer_per_head_bbox_3"]
+                    * metrics["length_patch_hd"][2]
+                )
+                metrics["overall_visual_attention_per_layer_per_head_bbox_4"] = (
+                    metrics["base_hit_per_layer_per_head_bbox_4"]
+                    * metrics["length_patch_base"][3]
+                    + metrics["hd_hit_per_layer_per_head_bbox_4"]
+                    * metrics["length_patch_hd"][3]
+                )
+                metrics["overall_visual_attention_per_layer_per_head_bbox_5"] = (
+                    metrics["base_hit_per_layer_per_head_bbox_5"]
+                    * metrics["length_patch_base"][4]
+                    + metrics["hd_hit_per_layer_per_head_bbox_5"]
+                    * metrics["length_patch_hd"][4]
+                )
                 save_json_path = os.path.join(
                     output_path,
                     output_image_name,
@@ -1143,20 +1277,6 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
                         save_hd_hit_per_layer_per_head_path,
                         hd_hit_per_layer_per_head_list[bbox_id].numpy(),
                     )
-                save_hd_hit_per_layer_per_head_path = os.path.join(
-                    output_path,
-                    output_image_name,
-                    f"obj_id{obj_id}",
-                    f"{genereated_token}",
-                    f"obj_id_{obj_id}_generated_token_{genereated_token}_hd_hit_per_layer_per_head.npy",
-                )
-                os.makedirs(
-                    os.path.dirname(save_hd_hit_per_layer_per_head_path), exist_ok=True
-                )
-                np.save(
-                    save_hd_hit_per_layer_per_head_path,
-                    hd_hit_per_layer_per_head.numpy(),
-                )
                 save_entropy_base_path = os.path.join(
                     output_path,
                     output_image_name,
