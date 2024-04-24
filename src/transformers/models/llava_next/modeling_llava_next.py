@@ -1332,6 +1332,10 @@ class LlavaNextForConditionalGeneration(LlavaNextPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
+        del outputs.attentions
+        outputs.attentions = None
+        torch.cuda.empty_cache()
+
         return LlavaNextCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
